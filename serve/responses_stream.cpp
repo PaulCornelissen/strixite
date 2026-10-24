@@ -166,6 +166,15 @@ void ResponsesStream::on_tool_call(const ToolCallOut &call) {
     if (entry == nullptr)
         throw ApiError(500, "the model emitted a call to tool '" + call.name + "' that the request did not offer",
                        {}, "server_error");
+    const json::Value *input = entry->find("kind")->as_string("kind") == "custom"
+                                   ? call.arguments.find("input")
+                                   : nullptr;
+    if (entry->find("kind")->as_string("kind") == "custom" && (!input || !input->is_string()))
+        // The parser accepts a name-only custom call (no required-param enforcement); the non-stream path
+        // refuses it typed - the stream validates at the same seam (the review's BLOCK-1: flush_tools would
+        // deref a missing input). A malformed call never reaches the wire; the route answers response.failed.
+        throw ApiError(500, "the custom tool call '" + call.name + "' carries no string 'input'", {},
+                       "server_error");
     // Buffered (the request's parser is the buffered one): the call is complete and registry-valid. Its item is
     // emitted at the terminal, with the terminal's status (a capped turn's calls are incomplete like its text).
     buffered_calls_.push_back(call);

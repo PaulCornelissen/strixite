@@ -117,8 +117,8 @@ std::string synthetic_tokenizer_json() {
 
 class ScriptedLmBackend : public LmBackend {
 public:
-    ScriptedLmBackend(int32_t vocab, std::vector<int32_t> script, int32_t im_end)
-        : vocab_(vocab), script_(std::move(script)), im_end_(im_end) {}
+    explicit ScriptedLmBackend(int32_t vocab, std::vector<int32_t> script)
+        : vocab_(vocab), script_(std::move(script)) {}
 
     int64_t capacity() const override { return 8192; }
     int64_t max_chunk() const override { return max_chunk_.load(); }
@@ -174,7 +174,7 @@ public:
     void set_throw_fatal(int64_t n) { forwards_ = 0; throw_fatal_.store(n); }   // -1: off
 
 private:
-    int32_t vocab_, im_end_;
+    int32_t vocab_;
     std::vector<int32_t> script_;
     int64_t at_ = 0, pos_ = 0;
     std::mutex mu_;
@@ -673,6 +673,40 @@ void check_routes(httplib::Client &cli, const std::string &model_id, const Token
         ok(res && res->status == 400 && res->body.find("tool name") != std::string::npos,
            "a control byte in a tool name is a named 400, got ", res ? std::to_string(res->status) : "none");
     }
+    {  // The review's BLOCK-1 on the wire: a streamed name-only custom call (the parser accepts it) gets
+       // the typed terminal - and the server is alive right after (the crash class this fix closes).
+        std::vector<int32_t> empty_call;
+        empty_call.push_back(tok.id_of(tag("tool_call").c_str()));
+        for (char c : std::string_view("\n<function=apply_patch>\n</function>\n"))
+            empty_call.push_back(tok.byte_token((uint8_t)c));
+        empty_call.push_back(tok.id_of(tagc("tool_call").c_str()));
+        empty_call.push_back(im_end);
+        be.set_script(empty_call);
+        std::string acc;
+        auto res = cli.Post("/v1/responses", httplib::Headers{},
+                            "{\"model\":\"" + model_id + "\",\"input\":\"patch nothing\",\"stream\":true,"
+                            "\"max_output_tokens\":64,\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\"}]}",
+                            "application/json", [&](const char *d, size_t l) { acc.append(d, l); return true; });
+        ok(res && res->status == 200, "the streamed refusal rides a 200 (headers sent), got ",
+           res ? std::to_string(res->status) : "none");
+        ok(acc.find("\"type\":\"response.failed\"") != std::string::npos, "typed response.failed for the empty custom call");
+        ok(acc.find("\"type\":\"response.completed\"") == std::string::npos, "never a fake completed");
+        ok(acc.find("custom_tool_call") == std::string::npos, "no custom item on the wire");
+        be.set_script(text_script);
+        auto res2 = cli.Post("/v1/responses", "{\"model\":\"" + model_id + "\",\"input\":\"hi\"}", "application/json");
+        ok(res2 && res2->status == 200, "the server is healthy right after (no crash, no leaked session)");
+    }
+    {  // The review's BLOCK-2: the schema NAME is client text reaching the format log row - control bytes
+       // must not forge log lines (the runner asserts the captured stdout has no forged line).
+        auto res = cli.Post("/v1/responses",
+                            "{\"model\":\"" + model_id + "\",\"input\":\"json\",\"max_output_tokens\":128,"
+                            "\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"po\\nFORGED-NAME-9q\",\"schema\":{}}}}",
+                            "application/json");
+        ok(res && res->status == 200, "a grammar request with a newline schema name runs (row sanitized), got ",
+           res ? std::to_string(res->status) : "none");
+        ok(res && json::Value::parse(res->body).find("status")->as_string("st") == "completed",
+           "the schema-name echo is the grammar turn's only exposure");
+    }
     {  // Log forging: the refused model name is echoed by the API (standard) - the LOG line gains no line
        // (the sanitizer; the negative grep check runs at the story's command level).
         auto res = cli.Post("/v1/responses", "{\"model\":\"q\\nFORGED-MARKER-7z\",\"input\":\"hi\"}", "application/json");
@@ -747,7 +781,7 @@ void check_failure_phase(const std::string &tok_path, const std::string &model_i
     for (char c : std::string_view(" Hello world")) text_script.push_back(tok.byte_token((uint8_t)c));
     const int32_t im_end = tok.id_of(sp("im_end").c_str());
     text_script.push_back(im_end);
-    ScriptedLmBackend be(tok.size(), text_script, im_end);
+    ScriptedLmBackend be(tok.size(), text_script);
     Engine::Options options;
     options.think_nudge = false;
     Engine engine(be, tok, options);
@@ -975,7 +1009,7 @@ int main(int argc, char **argv) {
         for (char c : std::string_view(" Hello world")) script.push_back(tok.byte_token((uint8_t)c));
         const int32_t im_end = tok.id_of(sp("im_end").c_str());
         script.push_back(im_end);
-        ScriptedLmBackend be(tok.size(), std::move(script), im_end);
+        ScriptedLmBackend be(tok.size(), std::move(script));
         Engine::Options options;
         options.think_nudge = false;  // no real repetitions to watch in a scripted answer
         Engine engine(be, tok, options);

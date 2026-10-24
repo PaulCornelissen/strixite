@@ -225,6 +225,28 @@ void check_incomplete_and_failed() {
     dump("failed_engine", gevents);
 }
 
+void check_custom_zero_arg() {
+    // The review's BLOCK-1: the parser accepts a name-only custom call (no required-param enforcement). The
+    // stream must refuse it typed at validation - never deref a missing input on the terminal.
+    ResponsesRequest rr = request_with("[{\"type\":\"custom\",\"name\":\"apply_patch\"}]");
+    ResponsesStream s("resp_c1", kModel, 1, rr.tool_registry);
+    s.ev_created();
+    bool threw = false;
+    std::string msg;
+    try {
+        s.on_tool_call(call("call_z", "apply_patch", "{}"));  // parsed args carry no input
+    } catch (const ApiError &e) {
+        threw = e.status == 500 && e.type == "server_error";
+        msg = e.what();
+    }
+    ok(threw && msg.find("no string 'input'") != std::string::npos,
+       "a custom call with no input string throws typed (never buffered)");
+    const std::string term = s.ev_failed(msg);
+    auto events = parse_frames(term);
+    ok(events.size() == 1 && type_of(events[0]) == "response.failed", "typed terminal after the refusal");
+    // (a name-only call is refused; the same call WITH input streams byte-for-byte - covered by mixed/multi_tool)
+}
+
 void check_unknown_tool_and_guards() {
     ResponsesRequest rr = request_with("[{\"type\":\"function\",\"name\":\"a\",\"parameters\":{\"type\":\"object\"}}]");
     ResponsesStream s("resp_u1", kModel, 1, rr.tool_registry);
@@ -251,6 +273,7 @@ int main(int argc, char **argv) {
     try {
         check_mixed();
         check_multi_tool_zero_text();
+        check_custom_zero_arg();
         check_incomplete_and_failed();
         check_unknown_tool_and_guards();
     } catch (const std::exception &e) {

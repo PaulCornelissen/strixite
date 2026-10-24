@@ -88,7 +88,7 @@ std::string log_safe(const std::string &text) {
     std::string out = text;
     for (char &c : out) {
         const unsigned char u = (unsigned char)c;
-        if (u < 0x20 || u == 0x7f || (u >= 0x80 && u < 0xa0)) c = '.';
+        if (u < 0x20 || u == 0x7f) c = '.';  // the forgers: control bytes (UTF-8 continuation bytes pass - logs are UTF-8)
     }
     return out;
 }
@@ -273,7 +273,8 @@ void HttpServer::routes() {
                 }
                 format_row = std::string(cr.response_format == ChatRequest::ResponseFormat::JsonObject ? "json_object"
                                                                                                         : "json_schema") +
-                             (cr.response_schema_name.empty() ? "" : " '" + cr.response_schema_name + "'") + " (grammar " +
+                             (cr.response_schema_name.empty() ? "" : " '" + log_safe(cr.response_schema_name) + "'") +
+                             " (grammar " +
                              (grammars_.misses() > misses ? "compiled" : "cached") + ", " + fmt_n(grammars_.size()) +
                              " cached)";
             }
@@ -535,7 +536,8 @@ void HttpServer::routes() {
                 format_row = std::string(rr.chat.response_format == ChatRequest::ResponseFormat::JsonObject
                                               ? "json_object"
                                               : "json_schema") +
-                             (rr.chat.response_schema_name.empty() ? "" : " '" + rr.chat.response_schema_name + "'") +
+                             (rr.chat.response_schema_name.empty() ? ""
+                                                                   : " '" + log_safe(rr.chat.response_schema_name) + "'") +
                              " (grammar " + (grammars_.misses() > misses ? "compiled" : "cached") + ", " +
                              fmt_n(grammars_.size()) + " cached)";
             }
