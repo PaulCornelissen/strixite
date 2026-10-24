@@ -27,6 +27,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <chrono>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -202,12 +203,18 @@ void check_routes(httplib::Client &cli, const std::string &model_id, const Token
         ok(res && res->status == 400, "POST foreign model -> 400, got ", res ? std::to_string(res->status) : "none");
         ok(err_field(*res, "param").as_string("param") == "model", "the refusal names 'model'");
     }
-    {  // POST, valid + stream:true: streaming lands with the SSE state machine -> typed 501 (never 404, never Chat chunks).
+    {  // POST, valid + stream:true (STORY-08): the typed SSE state machine answers (it replaced the 501).
         auto res = cli.Post("/v1/responses", "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"stream\":true}",
                             "application/json");
-        ok(res && res->status == 501, "valid streaming POST -> 501 while streaming is unwired, got ",
+        ok(res && res->status == 200, "valid streaming POST -> 200 (typed SSE), got ",
            res ? std::to_string(res->status) : "none");
-        ok(err_field(*res, "type").as_string("type") == "not_implemented", "the 501 is typed 'not_implemented'");
+        ok(res && res->headers.find("content-type") != res->headers.end() &&
+                   res->headers.find("content-type")->second.find("text/event-stream") != std::string::npos,
+           "Content-Type text/event-stream");
+        ok(res && res->body.find("\"type\":\"response.created\"") != std::string::npos &&
+                   res->body.find("\"type\":\"response.completed\"") != std::string::npos,
+           "created + completed frames in the body");
+        ok(res && res->body.find("[DONE]") == std::string::npos, "no Chat [DONE] sentinel");
     }
     {  // Unsupported semantics are refused on their path.
         auto res = cli.Post("/v1/responses", "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"store\":true}",
@@ -254,6 +261,7 @@ void check_routes(httplib::Client &cli, const std::string &model_id, const Token
            "usage from the engine: input/cached/output/reasoning tokens real");
     }
     {  // A tool call the request offered: a completed function_call item, ids separate, registry-checked.
+        std::fprintf(stderr, "DBG main: before tool POST\n");
         be.set_script(tool_script);
         auto res = cli.Post("/v1/responses",
                             "{\"model\":\"" + model_id + "\",\"input\":\"run f\",\"max_output_tokens\":64,"
@@ -274,6 +282,33 @@ void check_routes(httplib::Client &cli, const std::string &model_id, const Token
             ok(fc->find("id")->as_string("id") != fc->find("call_id")->as_string("call_id"), "item id separate");
             ok(fc->find("arguments")->as_string("arguments") == "{\"x\":1}", "arguments typed from the schema, as JSON text");
         }
+    }
+    {  // Streaming on the route (STORY-08): typed Responses SSE through the live pipeline.
+        be.set_script(text_script);  // the tool POST above left the call script armed
+        std::string acc;
+        auto res = cli.Post("/v1/responses", httplib::Headers{},
+                            "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"stream\":true}", "application/json",
+                            [&](const char *data, size_t len) { acc.append(data, len); return true; });
+        std::fprintf(stderr, "DBG case: responses streaming Post returned\n");
+        ok(res && res->status == 200, "streaming POST completed, status ", res ? std::to_string(res->status) : "none");
+        ok(acc.find("response.created") != std::string::npos && acc.find("response.in_progress") != std::string::npos,
+           "created + in_progress");
+        ok(acc.find("response.output_text.delta") != std::string::npos, "text deltas streamed");
+        ok(acc.find("response.completed") != std::string::npos, "typed terminal");
+        ok(acc.find("[DONE]") == std::string::npos, "no Chat [DONE] sentinel");
+        ok(acc.find("chat.completion.chunk") == std::string::npos, "no Chat chunks");
+        // Extract the data frames to jsonl for the pack stream validator.
+        std::ofstream out("/tmp/opencode/stream-http_generated.jsonl", std::ios::binary);
+        size_t pos = 0;
+        while ((pos = acc.find("data: ", pos)) != std::string::npos) {
+            const size_t end = acc.find("\n", pos);
+            out << acc.substr(pos + 6, end - pos - 6) << "\n";
+            pos = end;
+        }
+        ok(out.good(), "stream dumped");
+        out.close();
+        std::fprintf(stderr, "DBG main: streaming case done\n");
+        if (getenv("STREAM_ONLY")) { ok(true, "stream-only probe"); return; }
     }
     {  // Chat untouched: any model name is served (the model refusal above is Responses-only), the scripted
        // answer comes back as Chat content with real usage.
@@ -360,6 +395,14 @@ int main(int argc, char **argv) {
         const int port = server.bind();
         std::thread thr([&] { server.serve(); });
 
+        if (getenv("SERVE_ONLY")) {  // keep the scripted server up for external probes (python/pytest side)
+            std::printf("SERVING port=%d\n", port);
+            std::fflush(stdout);
+            std::this_thread::sleep_for(std::chrono::minutes(3));
+            server.stop();
+            thr.join();
+            return 0;
+        }
         httplib::Client cli("127.0.0.1", port);
         cli.set_read_timeout(10, 0);
         check_routes(cli, cfg.model_id, tok, be);

@@ -6,6 +6,7 @@
 #include "serve/openai.hpp"
 #include "serve/responses.hpp"
 #include "serve/responses_body.hpp"
+#include "serve/responses_stream.hpp"
 #include <httplib.h>  // third_party/cpp-httplib (vendored, SYSTEM include)
 
 #include <atomic>
@@ -468,9 +469,6 @@ void HttpServer::routes() {
                 throw ApiError(400, std::string("request body: ") + e.what());
             }
             rr = parse_responses_request(body, cfg_.defaults, cfg_.model_id);
-            if (rr.chat.stream)
-                throw ApiError(501, "POST /v1/responses: streaming on this route lands with the Responses SSE state machine; the non-streaming path is live",
-                               "stream", "not_implemented");
             // The server's thinking default for a request that named no reasoning effort (as the Chat route).
             if (!cfg_.thinking_default && !rr.chat.template_options.enable_thinking.has_value() &&
                 !thinking_requested(rr.chat))
@@ -509,9 +507,10 @@ void HttpServer::routes() {
             log_error(id, req, 500, e.what());
             return send_error(res, 500, e.what(), "server_error");
         }
-        gen.log_header = header_rows(req, false, rr.chat.model);
+        gen.log_header = header_rows(req, rr.chat.stream, rr.chat.model);
         gen.log_header.emplace_back("route", "responses");
         gen.id = id;
+        gen.stream = rr.chat.stream;
         if (!rr.chat.seeded) rr.chat.sampling.seed = std::random_device{}();
         gen.sampling = rr.chat.sampling;
         auto tools = std::make_shared<json::Value>(rr.chat.tools);  // outlives the request inside the engine
@@ -532,6 +531,72 @@ void HttpServer::routes() {
         } catch (const std::exception &e) {
             log_error(id, req, 503, e.what());
             return send_error(res, 503, e.what(), "server_error");
+        }
+        if (rr.chat.stream) {
+            // Typed Responses SSE (serve/responses_stream.hpp): created/in_progress, the item lifecycle with
+            // ordered sequence_number/output_index/content_index, raw reasoning + text deltas, tool items only
+            // complete (the buffered parser), SSE comments while the request waits/prefills, exactly one
+            // terminal (completed / incomplete / failed). No Chat chunks, no [DONE].
+            res.set_header("Cache-Control", "no-cache");
+            auto stream = std::make_shared<ResponsesStream>(random_id("resp_"), cfg_.model_id, unix_now(),
+                                                            rr.tool_registry);
+            const std::string opening = stream->ev_created();
+            const double keepalive = cfg_.keepalive_s;
+            res.set_chunked_content_provider("text/event-stream",
+                [sink, stream, opening, keepalive](size_t, httplib::DataSink &out) {
+                    const auto write = [&](const std::string &data) {
+                        if (!out.write(data.data(), data.size())) {
+                            sink->cancel();
+                            return false;
+                        }
+                        return true;
+                    };
+                    if (!write(opening)) return false;
+                    std::string progress;
+                    QueueSink::Item it;
+                    for (;;) {
+                        if (!sink->pop(it, keepalive)) {
+                            // The client leaving shows up as a failed write (as on the Chat stream); no
+                            // handler-scope references live here (the provider runs after the handler returns).
+                            if (!write(": " + (progress.empty() ? std::string("keep-alive") : progress) + "\n\n"))
+                                return false;
+                            continue;
+                        }
+                        switch (it.kind) {
+                        case QueueSink::Item::Kind::Start: progress = "started"; break;
+                        case QueueSink::Item::Kind::Progress:
+                            progress = "prefill " + std::to_string(it.progress.processed) + "/" +
+                                       std::to_string(it.progress.total);
+                            if (!write(": " + progress + "\n\n")) return false;
+                            break;
+                        case QueueSink::Item::Kind::Events:
+                            try {
+                                for (const OutputEvent &e : it.events) {
+                                    if (e.kind == OutputEvent::Kind::Reasoning) stream->on_reasoning(e.text);
+                                    else if (e.kind == OutputEvent::Kind::Content) stream->on_content(e.text);
+                                    else if (e.kind == OutputEvent::Kind::ToolCall) stream->on_tool_call(e.call);
+                                }
+                            } catch (const ApiError &e) {  // a call for an un-offered tool: typed terminal now
+                                write(stream->ev_failed(e.what()));
+                                out.done();
+                                return true;
+                            }
+                            if (!write(stream->take())) return false;
+                            break;
+                        case QueueSink::Item::Kind::Done: {
+                            const GenerationResult &r = it.result;
+                            const std::string term = r.finish_reason == "error"      ? stream->ev_failed(r.error)
+                                                     : r.finish_reason == "cancelled" ? stream->ev_failed("the request was cancelled")
+                                                     : r.finish_reason == "length"    ? stream->ev_incomplete(r)
+                                                                                      : stream->ev_completed(r);
+                            if (!term.empty()) write(term);
+                            out.done();
+                            return true;
+                        }
+                        }
+                    }
+                });
+            return;
         }
         std::string reasoning, content;
         std::vector<ToolCallOut> calls;
