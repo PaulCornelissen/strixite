@@ -1,6 +1,7 @@
 #include "serve/responses.hpp"
 
 #include <cctype>
+#include <map>
 #include <set>
 #include <string>
 #include <utility>
@@ -116,6 +117,120 @@ json::Value normalize_item(const json::Value &item, size_t k) {
     msg.set("role", json::Value::string(chat_role));
     msg.set("content", json::Value::string(std::move(text)));
     return msg;
+}
+
+// --- history items: tool calls, their outputs, reasoning metadata -------------------------------------------
+// Reconstructed into the Chat shapes the template renders: assistant messages carrying `tool_calls`, then the
+// `role: tool` results (the template groups consecutive ones into one user turn of <tool_call>/
+// <tool_response> turns). Pairing is by call_id, exact: every output names a preceding call of the transcript,
+// no id repeats, no output crosses a text message, a dangling call is refused at the next message (the final
+// turn may end on calls the client aborted: the transcript is still unambiguous). The registry is consulted for
+// shape only when the tool is CURRENTLY offered - a historical call whose tool is not in this request's tools
+// replays fine (the template renders the name; no live tool is needed to render the past).
+
+struct HistoryState {
+    long asst = -1;                                   // the open assistant message (receives calls), -1: none
+    bool calls_open = false;                          // calls may join `asst` (false: the last output closed it)
+    std::map<std::string, std::string> pending;       // call_id -> "function" | "custom" (no output yet)
+    std::set<std::string> ids;                        // every call_id seen (pairs are unique)
+};
+
+// One call item (function_call / custom_tool_call) appended to the open assistant message's tool_calls.
+void append_call_item(const json::Value &item, size_t k, const char *kind, std::vector<json::Value> &msgs,
+                      HistoryState &st, const json::Value &registry) {
+    const std::string path = "input[" + std::to_string(k) + "]";
+    const json::Value *cid = item.find("call_id");
+    if (!is_string(cid) || cid->as_string("call_id").empty())
+        bad("input", "'" + path + "' needs a non-empty string 'call_id'");
+    const std::string call_id = cid->as_string("call_id");
+    const json::Value *name = item.find("name");
+    if (!is_string(name)) bad("input", "'" + path + "' needs a string 'name'");
+    const std::string &n = name->as_string("name");
+    check_tool_name(n, "input");  // the name rides into the template's <function=NAME> markup: the tool rules
+    if (!st.ids.insert(call_id).second)
+        bad("input", "'" + path + "': duplicate call_id '" + call_id + "' (a transcript pairs every call uniquely)");
+    for (const auto &e : registry.as_array("registry"))  // shape check when the tool is currently offered
+        if (e.find("external")->as_string("external") == n && e.find("kind")->as_string("kind") != kind)
+            bad("input", "'" + path + "' is a " + kind + "_call for tool '" + n +
+                             "' offered as " + e.find("kind")->as_string("kind"));
+    json::Value args = json::Value::object();
+    if (std::string(kind) == "custom") {
+        const json::Value *in = item.find("input");
+        if (!is_string(in))
+            bad("input", "'" + path + "' (a custom call) needs a string 'input' (the raw text)");
+        args.set("input", json::Value::string(in->as_string("input")));  // kept byte-for-byte
+    } else {
+        const json::Value *a = item.find("arguments");
+        if (a && !a->is_null()) {
+            if (a->is_object()) {
+                args = *a;
+            } else if (a->is_string()) {
+                if (!a->as_string("arguments").empty()) {
+                    try {
+                        args = json::Value::parse(a->as_string("arguments"));
+                    } catch (const Error &e) {
+                        bad("input", "'" + path + ".arguments' is not a JSON object: " + e.what());
+                    }
+                    if (!args.is_object())
+                        bad("input", "'" + path + ".arguments' must hold a JSON object");
+                }
+            } else
+                bad("input", "'" + path + ".arguments' must be a JSON string or an object");
+        }
+    }
+    json::Value call = json::Value::object();
+    call.set("id", json::Value::string(call_id));
+    call.set("type", json::Value::string("function"));  // the Chat form; custom calls carry the raw text in 'input'
+    json::Value fn = json::Value::object();
+    fn.set("name", json::Value::string(n));
+    fn.set("arguments", std::move(args));
+    call.set("function", std::move(fn));
+    if (st.asst < 0 || !st.calls_open) {  // a new assistant turn (after text, after outputs, or bare)
+        json::Value m = json::Value::object();
+        m.set("role", json::Value::string("assistant"));
+        m.set("content", json::Value::string(""));
+        msgs.push_back(std::move(m));
+        st.asst = (long)msgs.size() - 1;
+        st.calls_open = true;
+    }
+    json::Value &a = msgs[(size_t)st.asst];
+    json::Value arr = a.find("tool_calls") ? *a.find("tool_calls") : json::Value::array();
+    arr.push(call);
+    a.set("tool_calls", std::move(arr));
+    st.pending[call_id] = kind;
+}
+
+// One tool result (*_output) closed against its call: a `role: tool` message, the template's tool turn.
+void append_output_item(const json::Value &item, size_t k, const char *kind, std::vector<json::Value> &msgs,
+                        HistoryState &st) {
+    const std::string path = "input[" + std::to_string(k) + "]";
+    const json::Value *cid = item.find("call_id");
+    if (!is_string(cid) || cid->as_string("call_id").empty())
+        bad("input", "'" + path + "' needs a non-empty string 'call_id'");
+    const std::string call_id = cid->as_string("call_id");
+    const auto it = st.pending.find(call_id);
+    if (it == st.pending.end())
+        bad("input", "'" + path + "': no open tool call with call_id '" + call_id +
+                         "' (unpaired, already answered, or from a later call)");
+    if (it->second != kind)
+        bad("input", "'" + path + "' is a " + kind + "_call_output for a " + it->second + " call");
+    st.pending.erase(it);
+    std::string text;
+    const json::Value *content = item.find("output");
+    if (!content || content->is_null()) text = "";  // an empty tool result is legal (a command with no output)
+    else if (content->is_string()) text = content->as_string("output");
+    else if (content->is_array())
+        for (size_t p = 0; p < content->as_array("output").size(); ++p)
+            text += part_text(content->as_array("output")[p], "input", path + ".output[" + std::to_string(p) + "]");
+    else
+        bad("input", "'" + path + ".output' must be a string, an array of content parts, or null");
+    json::Value m = json::Value::object();
+    m.set("role", json::Value::string("tool"));
+    m.set("tool_call_id", json::Value::string(call_id));
+    m.set("content", json::Value::string(std::move(text)));
+    msgs.push_back(std::move(m));
+    st.asst = -1;  // the assistant turn is answered; the next call opens a new one
+    st.calls_open = false;
 }
 
 // One Responses function tool -> the nested Chat form {type, function {name, description?, parameters, strict?}}.
@@ -401,17 +516,23 @@ ResponsesRequest parse_responses_request(const json::Value &body, const Sampling
     for (const char *skey : {"user", "safety_identifier"})
         if (const json::Value *v = field(body, skey)) get_string(*v, skey, skey);
 
+    // Tools parse before the conversation: the registry is the shape reference for replayed history calls.
+    parse_tools(field(body, "tools"), r, r.tool_choice);
+
     // input (+ instructions): the conversation, in order. instructions is a leading system message; items keep
-    // their order; the template needs at least one user message (as the Chat route requires).
-    json::Value messages = json::Value::array();
+    // their order; the template needs at least one user message (as the Chat route requires). Tool calls and
+    // their results rebuild the assistant/tool turns (HistoryState), paired by call_id with exact rules.
+    std::vector<json::Value> msgs;
+    HistoryState st;
     bool has_user = false;
+    const auto push_msg = [&](json::Value m) { msgs.push_back(std::move(m)); };
     if (const json::Value *v = field(body, "instructions")) {
         const std::string text = get_string(*v, "instructions", "instructions");
         if (!text.empty()) {
             json::Value m = json::Value::object();
             m.set("role", json::Value::string("system"));
             m.set("content", json::Value::string(std::move(text)));
-            messages.push(std::move(m));
+            push_msg(std::move(m));
         }
     }
     const json::Value *input = field(body, "input");
@@ -421,24 +542,64 @@ ResponsesRequest parse_responses_request(const json::Value &body, const Sampling
         json::Value m = json::Value::object();
         m.set("role", json::Value::string("user"));
         m.set("content", json::Value::string(input->as_string("input")));
-        messages.push(std::move(m));
+        push_msg(std::move(m));
         has_user = true;
     } else if (input->is_array()) {
         const auto &items = input->as_array("input");
         if (items.empty()) bad("input", "'input' must be a non-empty array of items");
         for (size_t k = 0; k < items.size(); ++k) {
-            json::Value m = normalize_item(items[k], k);
-            if (m.find("role")->as_string("role") == "user") has_user = true;
-            messages.push(std::move(m));
+            const json::Value &item = items[k];
+            const json::Value *type = item.is_object() ? item.find("type") : nullptr;
+            const std::string t = is_string(type) ? type->as_string("type") : "";
+            if (t == "reasoning") {
+                // History display metadata: plaintext thinking is not replayable through Codex serialization and
+                // is never invented here; the conversational context is the calls, outputs and messages.
+                if (!item.is_object()) bad("input", "input[" + std::to_string(k) + "] reasoning item must be an object");
+                continue;
+            }
+            if (t == "function_call") {
+                append_call_item(item, k, "function", msgs, st, r.tool_registry);
+                continue;
+            }
+            if (t == "custom_tool_call") {
+                append_call_item(item, k, "custom", msgs, st, r.tool_registry);
+                continue;
+            }
+            if (t == "function_call_output") {
+                append_output_item(item, k, "function", msgs, st);
+                continue;
+            }
+            if (t == "custom_tool_call_output") {
+                append_output_item(item, k, "custom", msgs, st);
+                continue;
+            }
+            // A text message item ends the transcript's open turn: a call without its output may not be crossed
+            // over (that is the ambiguous pairing the contract refuses, not silently pairs).
+            if (!st.pending.empty())
+                bad("input", "input[" + std::to_string(k) + "]: the tool call '" + st.pending.begin()->first +
+                                 "' has no output before this message (unpaired)");
+            json::Value m = normalize_item(item, k);
+            const std::string role = m.find("role")->as_string("role");
+            if (role == "user") has_user = true;
+            if (role == "assistant") {  // a following call joins this assistant turn (their item order is kept)
+                st.asst = (long)msgs.size();
+                st.calls_open = true;
+            } else {
+                st.asst = -1;
+                st.calls_open = false;
+            }
+            push_msg(std::move(m));
         }
+        // Trailing calls with no output are allowed: the transcript's last turn ended on calls (an aborted tool
+        // round); every earlier one is refused above. Nothing is paired to a wrong call.
     } else {
         bad("input", "'input' must be a string or an array of input items, got " +
                          std::string(json::type_name(input->type())));
     }
     if (!has_user) bad("input", "the input has no user message (the template requires a query to answer)");
+    json::Value messages = json::Value::array();
+    for (auto &m : msgs) messages.push(std::move(m));
     r.chat.messages = std::move(messages);
-
-    parse_tools(field(body, "tools"), r, r.tool_choice);
     return r;
 }
 

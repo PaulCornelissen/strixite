@@ -178,9 +178,9 @@ struct NegCase {
 std::vector<NegCase> negative_cases() {
     return {
         {"input with role tool is refused (outputs are *_output items)", body("\"input\":[{\"type\":\"message\",\"role\":\"tool\",\"content\":\"x\"}]"), "input"},
-        {"function_call item refused until history replay", body("\"input\":[{\"type\":\"function_call\",\"name\":\"f\",\"arguments\":\"{}\",\"call_id\":\"c\"}]"), "input"},
-        {"function_call_output item refused until history replay", body("\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"c\",\"output\":\"x\"}]"), "input"},
-        {"reasoning item refused until history replay", body("\"input\":[{\"type\":\"reasoning\",\"id\":\"r\"}]"), "input"},
+        {"lone call item without a user message: input 400 (pairing now replayed, the query is required)", body("\"input\":[{\"type\":\"function_call\",\"name\":\"f\",\"arguments\":\"{}\",\"call_id\":\"c\"}]"), "input"},
+        {"tool output with no matching call: refused (unpaired)", body("\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"c\",\"output\":\"x\"}]"), "input"},
+        {"reasoning alone: metadata skipped, the user query is required", body("\"input\":[{\"type\":\"reasoning\",\"id\":\"r\"}]"), "input"},
         {"item_reference refused as unrecognized", body("\"input\":[{\"type\":\"item_reference\",\"id\":\"x\"}]"), "input"},
         {"role from_mars refused", body("\"input\":[{\"type\":\"message\",\"role\":\"from_mars\",\"content\":\"x\"}]"), "input"},
         {"non-string role refused", body("\"input\":[{\"type\":\"message\",\"role\":7,\"content\":\"x\"}]"), "input"},

@@ -1,0 +1,29 @@
+{
+ "_fixture": "SIMULATED multi-turn Codex transcript for history replay (STORY-06): call/output/reasoning item shapes from the codex-cli 0.162.1 binary's ResponseItem strings (function_call{call_id,name,arguments}, function_call_output{call_id,output}, custom_tool_call{call_id,name,input}, custom_tool_call_output, reasoning{summary,encrypted_content}) + the OpenAI Responses item spec. The installed Codex's exec mode was captured at STORY-01 for the request envelope; this transcript combines those shapes into the two-tool-round conversation Codex replays after tool use. Not captured traffic - labeled simulated.",
+ "_label": "SIMULATED",
+ "model": "qwen3.8-flash-next",
+ "stream": true,
+ "store": false,
+ "tool_choice": "auto",
+ "reasoning": {"effort": "medium", "summary": "auto"},
+ "include": ["reasoning.encrypted_content"],
+ "input": [
+  {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are a coding agent running in the Codex CLI."}]},
+  {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Create marker.txt with the word ok, then verify it."}]},
+  {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "ENC_BLOB_REDACTED"},
+  {"type": "function_call", "name": "exec_command", "call_id": "call_1", "arguments": "{\"cmd\":\"printf ok > marker.txt\",\"workdir\":\"/tmp/proj\"}"},
+  {"type": "function_call", "name": "exec_command", "call_id": "call_2", "arguments": "{\"cmd\":\"cat marker.txt\"}"},
+  {"type": "function_call_output", "call_id": "call_2", "output": "ok\n"},
+  {"type": "function_call_output", "call_id": "call_1", "output": ""},
+  {"type": "custom_tool_call", "name": "apply_patch", "call_id": "call_3", "input": "*** Begin Patch\n*** Update File: notes.md\n@@\n-plain\n+patched é —\n*** End Patch"},
+  {"type": "custom_tool_call_output", "call_id": "call_3", "output": "Success. Updated the following files:\nM notes.md"},
+  {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Created marker.txt (verified: ok) and patched notes.md."}]},
+  {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Now remove the marker file."}]}
+ ],
+ "tools": [
+  {"type": "function", "name": "exec_command", "description": "Runs a command in a PTY.", "strict": false,
+   "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}, "workdir": {"type": "string"}}, "required": ["cmd"]}},
+  {"type": "custom", "name": "apply_patch", "description": "Update the sources by applying a patch.",
+   "format": {"type": "grammar", "grammar": {"type": "lark", "definition": "start: begin_patch hunk+ end_patch\n"}}}
+ ]
+}

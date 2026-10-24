@@ -272,6 +272,10 @@ target_link_libraries(check_responses_tools PRIVATE strix_serve)
 add_executable(check_responses_custom tools/check_responses_custom.cpp)
 target_link_libraries(check_responses_custom PRIVATE strix_serve)
 
+# The /v1/responses multi-turn history replay: pairing rules, parallel/delayed outputs, determinism to the prompt.
+add_executable(check_responses_history tools/check_responses_history.cpp)
+target_link_libraries(check_responses_history PRIVATE strix_serve)
+
 # The /v1/responses HTTP surface on a scripted backend (a synthetic tokenizer stands in for the model's), host
 # only: the route contract (400/501, never 404) and the untouched Chat route end to end without a GPU.
 add_executable(check_responses_http tools/check_responses_http.cpp)
