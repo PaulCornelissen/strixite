@@ -37,14 +37,16 @@ double get_number(const json::Value &v, const std::string &param, const std::str
     return v.as_double(path);
 }
 
-// A tool's name: non-empty, printable, bounded. (Names reach the chat template's tool header and the model's
-// <function=NAME> tags; whitespace, control bytes and newlines would forge turn structure.)
+// A tool's name: non-empty, printable, bounded, and safe for the model's call tags. (Names reach the chat
+// template's tool header and the model's <function=NAME> tags; whitespace, control bytes and newlines would forge
+// turn structure, and '<', '>' or '=' would forge the call tags the output parser reads back.)
 void check_tool_name(const std::string &name, const std::string &param) {
     if (name.empty()) bad(param, "a tool name must be non-empty");
     if (name.size() > 256) bad(param, "tool name '" + name.substr(0, 32) + "...' is longer than 256 bytes");
     for (unsigned char c : name)
-        if (c <= 0x20 || c == 0x7f || (c >= 0x80 && c < 0xa0))
-            bad(param, "tool name '" + name + "' holds whitespace, a control character, or a non-printable byte");
+        if (c <= 0x20 || c == 0x7f || (c >= 0x80 && c < 0xa0) || c == '<' || c == '>' || c == '=')
+            bad(param, "tool name '" + name + "' holds whitespace, a control character, a non-printable byte, "
+                        "or a tag-significant character ('<', '>', '=')");
 }
 
 // One text content part's text; parts the build can't serve yet are explicit 400s (never dropped).
@@ -128,11 +130,19 @@ void add_function_tool(const json::Value &tool, const std::string &ns, const std
     const json::Value *params = tool.find("parameters");
     if (!params || !params->is_object())
         bad(param, "tool '" + n + "' needs an object 'parameters' (the JSON schema of its arguments)");
+    // The argument schema is an object schema: the output parser types parameter values from its `properties`,
+    // and a schema the generator cannot answer with an object is not a callable tool.
+    const json::Value *ptype = params->find("type");
+    if (!(is_string(ptype) && ptype->as_string("tools[].parameters.type") == "object"))
+        bad(param, "tool '" + n + "' parameters: the schema's top-level type must be \"object\", got " +
+                       (is_string(ptype) ? "'" + ptype->as_string("tools[].parameters.type") + "'" : "no type"));
     if (!names.insert(external).second) bad(param, "duplicate tool name '" + external + "'");
     json::Value fn = json::Value::object();
     if (const json::Value *d = tool.find("description"); is_string(d))
         fn.set("description", json::Value::string(d->as_string("tools[].description")));
-    fn.set("name", json::Value::string(n));
+    // The model-facing name is the flat external form (a namespace child as "namespace/name"): what the model
+    // emits in <function=NAME> must identify the tool uniquely across namespaces, and it is the registry key.
+    fn.set("name", json::Value::string(external));
     fn.set("parameters", *params);
     if (const json::Value *s = tool.find("strict"); s && !s->is_null())
         fn.set("strict", json::Value::boolean(get_bool(*s, param, "tools[].strict")));  // accepted; schemas render as sent

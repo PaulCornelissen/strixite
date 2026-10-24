@@ -264,6 +264,10 @@ target_link_libraries(check_responses PRIVATE strix_serve)
 add_executable(check_responses_norm tools/check_responses_norm.cpp)
 target_link_libraries(check_responses_norm PRIVATE strix_serve)
 
+# The /v1/responses tool registry: real Codex schema round trip, mapping, collision rules, host only.
+add_executable(check_responses_tools tools/check_responses_tools.cpp)
+target_link_libraries(check_responses_tools PRIVATE strix_serve)
+
 # The /v1/responses HTTP surface on a scripted backend (a synthetic tokenizer stands in for the model's), host
 # only: the route contract (400/501, never 404) and the untouched Chat route end to end without a GPU.
 add_executable(check_responses_http tools/check_responses_http.cpp)
