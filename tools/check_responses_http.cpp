@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <mutex>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -144,11 +146,18 @@ public:
     void import_state(const HostBuffer &, int64_t n, int64_t) override { pos_ = n; }
     std::string state_fingerprint() const override { return "scripted-host-test"; }
     std::string describe() const override { return "ScriptedLmBackend(host test)"; }
+    // Swap the scripted answer (the route test drives text and tool-call turns on one backend).
+    void set_script(std::vector<int32_t> script) {
+        std::lock_guard<std::mutex> lk(mu_);
+        script_ = std::move(script);
+        at_ = 0;
+    }
 
 private:
     int32_t vocab_, im_end_;
     std::vector<int32_t> script_;
     int64_t at_ = 0, pos_ = 0;
+    std::mutex mu_;
     int64_t snap_[4] = {-1, -1, -1, -1};
 };
 
@@ -165,7 +174,20 @@ json::Value err_field(const httplib::Response &res, const char *key) {
     return json::Value();
 }
 
-void check_routes(httplib::Client &cli, const std::string &model_id) {
+void check_routes(httplib::Client &cli, const std::string &model_id, const Tokenizer &tok, ScriptedLmBackend &be) {
+    // The text answer (default) and the tool-call answer, replayed per request; scripts swap between cases.
+    std::vector<int32_t> text_script;
+    for (char c : std::string_view("thinking\n")) text_script.push_back(tok.byte_token((uint8_t)c));
+    text_script.push_back(tok.id_of(tagc("think").c_str()));
+    for (char c : std::string_view(" Hello world")) text_script.push_back(tok.byte_token((uint8_t)c));
+    const int32_t im_end = tok.id_of(sp("im_end").c_str());
+    text_script.push_back(im_end);
+    std::vector<int32_t> tool_script;
+    tool_script.push_back(tok.id_of(tag("tool_call").c_str()));
+    for (char c : std::string_view("\n<function=f>\n<parameter=x>\n1\n</parameter>\n</function>\n"))
+        tool_script.push_back(tok.byte_token((uint8_t)c));
+    tool_script.push_back(tok.id_of(tagc("tool_call").c_str()));
+    tool_script.push_back(im_end);
     {  // GET on the route: not a registered method - the documented 404 (Codex sends POST).
         auto res = cli.Get("/v1/responses");
         ok(res && res->status == 404, "GET /v1/responses -> 404, got ", res ? std::to_string(res->status) : "none");
@@ -180,9 +202,11 @@ void check_routes(httplib::Client &cli, const std::string &model_id) {
         ok(res && res->status == 400, "POST foreign model -> 400, got ", res ? std::to_string(res->status) : "none");
         ok(err_field(*res, "param").as_string("param") == "model", "the refusal names 'model'");
     }
-    {  // POST, a valid request: the contract accepts it; generation lands in later stories -> typed 501, not 404.
-        auto res = cli.Post("/v1/responses", "{\"model\":\"" + model_id + "\",\"input\":\"hi\"}", "application/json");
-        ok(res && res->status == 501, "valid POST -> 501 while unwired, got ", res ? std::to_string(res->status) : "none");
+    {  // POST, valid + stream:true: streaming lands with the SSE state machine -> typed 501 (never 404, never Chat chunks).
+        auto res = cli.Post("/v1/responses", "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"stream\":true}",
+                            "application/json");
+        ok(res && res->status == 501, "valid streaming POST -> 501 while streaming is unwired, got ",
+           res ? std::to_string(res->status) : "none");
         ok(err_field(*res, "type").as_string("type") == "not_implemented", "the 501 is typed 'not_implemented'");
     }
     {  // Unsupported semantics are refused on their path.
@@ -197,8 +221,63 @@ void check_routes(httplib::Client &cli, const std::string &model_id) {
         res = cli.Post("/v1/responses", "{not json", "application/json");
         ok(res && res->status == 400, "a body that is not JSON -> 400");
     }
+    {  // Non-streaming generation on the route (STORY-07): the scripted answer comes back as typed Responses items.
+        auto res = cli.Post("/v1/responses", "{\"model\":\"" + model_id + "\",\"input\":\"hi\"}", "application/json");
+        ok(res && res->status == 200, "valid non-streaming POST -> 200, got ", res ? std::to_string(res->status) : "none",
+           res ? " body " + res->body.substr(0, 200) : "");
+        if (!res || res->status != 200) return;
+        json::Value b = json::Value::parse(res->body);
+        ok(b.find("object") && b.find("object")->as_string("object") == "response", "object=response");
+        ok(b.find("id") && b.find("id")->as_string("id").rfind("resp_", 0) == 0, "response id is resp_*");
+        ok(b.find("model")->as_string("model") == model_id, "model is the served id");
+        ok(b.find("status")->as_string("status") == "completed", "status completed");
+        ok(b.find("created_at") && b.find("created_at")->as_int("created_at") > 1700000000, "created_at is now");
+        const json::Value &out = *b.find("output");
+        ok(out.is_array() && out.as_array("output").size() >= 2, "reasoning + message items, got ",
+           (long)out.as_array("output").size());
+        ok(out.as_array("output")[0].find("type")->as_string("type") == "reasoning" &&
+                   out.as_array("output")[0].find("summary")->as_array("s").empty() &&
+                   out.as_array("output")[0].find("encrypted_content")->is_null(),
+           "raw reasoning item: summary [], encrypted_content null");
+        bool found_msg = false;
+        for (const auto &it : out.as_array("output"))
+            if (it.find("type")->as_string("type") == "message") {
+                found_msg = true;
+                ok(it.find("content")->as_array("c")[0].find("text")->as_string("text") == "Hello world",
+                   "message item carries the scripted answer");
+            }
+        ok(found_msg, "a message item exists");
+        const json::Value &u = *b.find("usage");
+        ok(u.find("input_tokens")->as_int("i") > 0 && u.find("output_tokens")->as_int("o") > 0 &&
+                   u.find("input_tokens_details")->find("cached_tokens") != nullptr &&
+                   u.find("output_tokens_details")->find("reasoning_tokens")->as_int("rt") > 0,
+           "usage from the engine: input/cached/output/reasoning tokens real");
+    }
+    {  // A tool call the request offered: a completed function_call item, ids separate, registry-checked.
+        be.set_script(tool_script);
+        auto res = cli.Post("/v1/responses",
+                            "{\"model\":\"" + model_id + "\",\"input\":\"run f\",\"max_output_tokens\":64,"
+                            "\"tools\":[{\"type\":\"function\",\"name\":\"f\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"number\"}}}}]}",
+                            "application/json");
+        ok(res && res->status == 200, "tool-call POST -> 200, got ", res ? std::to_string(res->status) : "none",
+           res ? " body " + res->body.substr(0, 300) : "");
+        if (!res || res->status != 200) return;
+        json::Value b = json::Value::parse(res->body);
+        ok(b.find("status")->as_string("status") == "completed", "completed with a call");
+        const json::Value *fc = nullptr;
+        for (const auto &it : b.find("output")->as_array("output"))
+            if (it.find("type") && it.find("type")->as_string("type") == "function_call") fc = &it;
+        ok(fc != nullptr, "function_call item published");
+        if (fc) {
+            ok(fc->find("name")->as_string("name") == "f", "name f");
+            ok(fc->find("call_id")->as_string("call_id").rfind("call_", 0) == 0, "parser call_id (call_*)");
+            ok(fc->find("id")->as_string("id") != fc->find("call_id")->as_string("call_id"), "item id separate");
+            ok(fc->find("arguments")->as_string("arguments") == "{\"x\":1}", "arguments typed from the schema, as JSON text");
+        }
+    }
     {  // Chat untouched: any model name is served (the model refusal above is Responses-only), the scripted
        // answer comes back as Chat content with real usage.
+        be.set_script(text_script);
         auto res = cli.Post("/v1/chat/completions",
                             "{\"model\":\"anything\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
                             "\"temperature\":0,\"max_tokens\":2048}",
@@ -283,7 +362,7 @@ int main(int argc, char **argv) {
 
         httplib::Client cli("127.0.0.1", port);
         cli.set_read_timeout(10, 0);
-        check_routes(cli, cfg.model_id);
+        check_routes(cli, cfg.model_id, tok, be);
 
         server.stop();
         thr.join();

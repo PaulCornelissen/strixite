@@ -216,6 +216,7 @@ add_library(strix_serve STATIC
     serve/server_config.cpp
     serve/openai.cpp
     serve/responses.cpp
+    serve/responses_body.cpp
     serve/http_server.cpp
     serve/memory_plan.cpp
     serve/prompt_cache.cpp
@@ -275,6 +276,10 @@ target_link_libraries(check_responses_custom PRIVATE strix_serve)
 # The /v1/responses multi-turn history replay: pairing rules, parallel/delayed outputs, determinism to the prompt.
 add_executable(check_responses_history tools/check_responses_history.cpp)
 target_link_libraries(check_responses_history PRIVATE strix_serve)
+
+# The non-streaming /v1/responses serializer: every outcome shape, usage, ids, refusals, host only.
+add_executable(check_responses_body tools/check_responses_body.cpp)
+target_link_libraries(check_responses_body PRIVATE strix_serve)
 
 # The /v1/responses HTTP surface on a scripted backend (a synthetic tokenizer stands in for the model's), host
 # only: the route contract (400/501, never 404) and the untouched Chat route end to end without a GPU.

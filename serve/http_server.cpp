@@ -5,6 +5,7 @@
 #include "serve/log.hpp"
 #include "serve/openai.hpp"
 #include "serve/responses.hpp"
+#include "serve/responses_body.hpp"
 #include <httplib.h>  // third_party/cpp-httplib (vendored, SYSTEM include)
 
 #include <atomic>
@@ -450,12 +451,15 @@ void HttpServer::routes() {
         });
     });
 
-    // Responses API (the wire Codex drives): parse, validate, normalize into the Chat pipeline's form. Every
-    // rejected request is a typed 400 naming its field; a valid one is accepted generation not wired to this
-    // route yet, so it gets a typed 501 (B2: never a 404, never a Chat-shaped answer). The Chat route below is
-    // untouched: same handler, same defaults, same streaming - the new route shares the code, not the surface.
+    // Responses API (the wire Codex drives): validate + normalize, then run the SAME generation pipeline the Chat
+    // route uses (render, tokenize, engine, QueueSink - no second path). Non-streaming is answered here in full
+    // (typed 400s while validating, the typed serializer body on success); streaming stays a typed 501 until the
+    // Responses SSE state machine (docs/server.md). Never a 404, never a Chat-shaped answer from this route.
     svr_->Post("/v1/responses", [this](const httplib::Request &req, httplib::Response &res) {
         const int64_t id = ++next_id_;
+        ResponsesRequest rr;
+        GenerationRequest gen;
+        bool clamped = false;
         try {
             json::Value body;
             try {
@@ -463,13 +467,100 @@ void HttpServer::routes() {
             } catch (const Error &e) {
                 throw ApiError(400, std::string("request body: ") + e.what());
             }
-            parse_responses_request(body, cfg_.defaults, cfg_.model_id);
-            throw ApiError(501, "POST /v1/responses: the request is valid for this server; generation on this route lands in the next stories (docs/server.md)",
-                            {}, "not_implemented");
+            rr = parse_responses_request(body, cfg_.defaults, cfg_.model_id);
+            if (rr.chat.stream)
+                throw ApiError(501, "POST /v1/responses: streaming on this route lands with the Responses SSE state machine; the non-streaming path is live",
+                               "stream", "not_implemented");
+            // The server's thinking default for a request that named no reasoning effort (as the Chat route).
+            if (!cfg_.thinking_default && !rr.chat.template_options.enable_thinking.has_value() &&
+                !thinking_requested(rr.chat))
+                rr.chat.template_options.enable_thinking = false;
+            std::string prompt;
+            std::vector<std::pair<size_t, size_t>> plain_spans;  // what the request wrote: never control tokens
+            try {
+                prompt = render_chat(rr.chat.messages, rr.chat.tools.is_null() ? nullptr : &rr.chat.tools,
+                                     rr.chat.template_options, &plain_spans);
+            } catch (const Error &e) {
+                throw ApiError(400, e.what(), "input");
+            }
+            gen.prompt = tok_.encode(prompt, plain_spans);
+            const json::Value &last = rr.chat.messages.as_array("messages").back();
+            gen.user_turn = last.find("role") && last.find("role")->is_string() &&
+                            last.find("role")->as_string("role") == "user";
+            gen.one_shot = rr.chat.messages.as_array("messages").size() == 1 && rr.chat.tools.is_null();
+            gen.max_tokens = clamp_max_tokens(rr.chat.max_tokens, (int64_t)gen.prompt.size(), engine_.capacity(),
+                                               clamped);
+            if (thinking_left_out(rr.chat, gen.max_tokens)) {  // no room to think: render without the block (Chat's rule)
+                rr.chat.template_options.enable_thinking = false;
+                try {
+                    prompt = render_chat(rr.chat.messages, rr.chat.tools.is_null() ? nullptr : &rr.chat.tools,
+                                         rr.chat.template_options, &plain_spans);
+                } catch (const Error &e) {
+                    throw ApiError(400, e.what(), "input");
+                }
+                gen.prompt = tok_.encode(prompt, plain_spans);
+                gen.max_tokens = clamp_max_tokens(rr.chat.max_tokens, (int64_t)gen.prompt.size(), engine_.capacity(),
+                                                   clamped);
+            }
         } catch (const ApiError &e) {
             log_error(id, req, e.status, e.what());
-            send_error(res, e.status, e.what(), e.type, e.param);
+            return send_error(res, e.status, e.what(), e.type, e.param);
+        } catch (const std::exception &e) {
+            log_error(id, req, 500, e.what());
+            return send_error(res, 500, e.what(), "server_error");
         }
+        gen.log_header = header_rows(req, false, rr.chat.model);
+        gen.log_header.emplace_back("route", "responses");
+        gen.id = id;
+        if (!rr.chat.seeded) rr.chat.sampling.seed = std::random_device{}();
+        gen.sampling = rr.chat.sampling;
+        auto tools = std::make_shared<json::Value>(rr.chat.tools);  // outlives the request inside the engine
+        gen.parser.thinking =
+            !(rr.chat.template_options.enable_thinking.has_value() && !*rr.chat.template_options.enable_thinking);
+        gen.parser.tools = tools->is_null() ? nullptr : tools.get();
+        gen.parser.stop = rr.chat.stop;
+        gen.parser.id_seed = std::random_device{}();
+        gen.parser.stream_calls = false;  // buffered: only completed, valid calls are published
+        gen.thinking_budget = thinking_budget_for(rr.chat, gen.max_tokens);
+        if (cfg_.thinking_cap > 0 && !rr.chat.thinking_budget.has_value() && gen.thinking_budget > cfg_.thinking_cap) {
+            gen.thinking_budget = cfg_.thinking_cap;
+            gen.thinking_budget_grace = cfg_.thinking_cap_grace;
+        }
+        auto sink = std::make_shared<QueueSink>();
+        try {
+            engine_.submit(std::move(gen), sink);
+        } catch (const std::exception &e) {
+            log_error(id, req, 503, e.what());
+            return send_error(res, 503, e.what(), "server_error");
+        }
+        std::string reasoning, content;
+        std::vector<ToolCallOut> calls;
+        QueueSink::Item it;
+        for (;;) {
+            if (!sink->pop(it, 0.25)) {
+                if (req.is_connection_closed()) sink->cancel();
+                continue;
+            }
+            if (it.kind == QueueSink::Item::Kind::Events)
+                for (OutputEvent &e : it.events) {
+                    if (e.kind == OutputEvent::Kind::Reasoning) reasoning += e.text;
+                    else if (e.kind == OutputEvent::Kind::Content) content += e.text;
+                    else if (e.kind == OutputEvent::Kind::ToolCall) calls.push_back(std::move(e.call));
+                }
+            if (it.kind == QueueSink::Item::Kind::Done) break;
+        }
+        if (it.result.finish_reason == "error") {
+            log_error(id, req, 500, it.result.error);
+            return send_error(res, 500, it.result.error, "server_error");
+        }
+        json::Value out;
+        try {
+            out = responses_body(rr, random_id("resp_"), unix_now(), reasoning, content, calls, it.result);
+        } catch (const ApiError &e) {
+            log_error(id, req, e.status, e.what());
+            return send_error(res, e.status, e.what(), e.type, e.param);
+        }
+        res.set_content(out.dump(), "application/json");
     });
 
     // Legacy completions: the raw prompt as is - no chat template, no
