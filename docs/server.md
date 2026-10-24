@@ -169,3 +169,33 @@ Two honest limits:
 - **No encrypted reasoning.** `include: ["reasoning.encrypted_content"]` is accepted; the field is always `null`.
 
 To see the thinking in Codex, set `show_raw_agent_reasoning = true` in `~/.codex/config.toml`.
+
+## Responses (`POST /v1/responses`): structured output and images
+
+`text.format` lands on the same structured-output machinery the Chat route runs - the same compiler, the same
+grammar cache, the same keyword-level refusals:
+
+| `text.format.type` | what happens |
+|---|---|
+| `"text"` (or absent) | free text |
+| `"json_object"` | the answer is grammar-enforced to be one JSON object |
+| `"json_schema"` | the answer is grammar-enforced to follow `schema` (with `name`, `strict` accepted) |
+
+Enforcement is the grammar, so it is real: `strict: true` is accepted as the shape's marker, not as a promise -
+output is constrained whether the client asked strictly or not. A schema the compiler cannot enforce (unsupported
+keywords, schema-typed `additionalProperties`, tuple `items`) is a 400 naming the keyword - never a silent
+downgrade to unconstrained output.
+
+Images: a user message's content array may interleave `input_text` and `input_image` parts, and the images reach
+the vision pipeline in document order - **when the server runs with a vision tower** (config `vision`). Every
+other case is a named refusal, never a silent drop:
+
+- no tower: `400 ... image part: this server runs without a vision tower`
+- `image_url` must be a `data:` URL - the server fetches nothing, so `https://` URLs are refused
+- `file_id` is refused: the Responses surface here is stateless, there is no file store
+- `detail` is validated (`auto`, `low`, `high`)
+- images in assistant messages or tool outputs, and audio/video/file parts, are refused as named
+
+The vision path through `/v1/responses` is the Chat route's pipeline verbatim (one shared implementation: same
+pad expansion, mRoPE walk, decode memo, preprocess gate); its behavior on a real tower is exercised on
+vision-served builds (the host test suite covers the parser rules and the vision-off refusals).

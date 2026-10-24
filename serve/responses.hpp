@@ -39,7 +39,9 @@ struct ResponsesRequest {
 // this one never claims to be a model it is not). Every field is deliberate: benign client metadata parses and
 // goes unused; unsupported semantics, unrecognized input item kinds and unknown fields are explicit 400s naming
 // the field - never silently dropped, never silently served. Throws ApiError (400, the path in `param`).
+// vision_enabled (the server's vision tower, as in the Chat parser): data-URL input_image parts in user
+// messages reach the Chat image pipeline in document order; without a tower an image part is a named refusal.
 ResponsesRequest parse_responses_request(const json::Value &body, const SamplingParams &defaults,
-                                          const std::string &served_model_id);
+                                          const std::string &served_model_id, bool vision_enabled = false);
 
 }  // namespace strix

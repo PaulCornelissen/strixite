@@ -1,5 +1,7 @@
 #include "serve/responses.hpp"
 
+#include "serve/vision_request.hpp"  // parse_data_url: the one data-URL policy (Chat and Responses agree)
+
 #include <cctype>
 #include <map>
 #include <set>
@@ -51,31 +53,95 @@ void check_tool_name(const std::string &name, const std::string &param) {
 }
 
 // One text content part's text; parts the build can't serve yet are explicit 400s (never dropped).
-std::string part_text(const json::Value &part, const std::string &param, const std::string &path) {
+// One content part. Text and refusal parts yield text; an image part (user messages, and only when the server
+// runs a vision tower) yields the Chat part shape and appends its parsed bytes to `images` - document order
+// everywhere (parts, then items), which is exactly the Chat pipeline's stream order. Remote URLs and file ids
+// are named refusals: this server fetches nothing and stores nothing, and says so.
+void normalize_part(const json::Value &part, const std::string &param, const std::string &path,
+                    bool vision_enabled, bool allow_images, std::vector<vision::ParsedImage> &images,
+                    std::string &text, std::vector<json::Value> *parts, bool &has_image) {
     if (!part.is_object()) bad(param, "'" + path + "' must be an object, got " + std::string(json::type_name(part.type())));
     const json::Value *type = part.find("type");
     if (!is_string(type)) bad(param, "'" + path + ".type' must be a string");
     const std::string &t = type->as_string(path + ".type");
     if (t == "input_text" || t == "output_text" || t == "text") {
-        const json::Value *text = part.find("text");
-        if (!is_string(text)) bad(param, "'" + path + ".text' must be a string");
-        return text->as_string(path + ".text");
+        const json::Value *text_v = part.find("text");
+        if (!is_string(text_v)) bad(param, "'" + path + ".text' must be a string");
+        text += text_v->as_string(path + ".text");
+        if (parts) {
+            json::Value tp = json::Value::object();
+            tp.set("type", json::Value::string("text"));
+            tp.set("text", *text_v);
+            parts->push_back(std::move(tp));
+        }
+        return;
     }
     if (t == "refusal") {  // assistant refusal text: kept as the message's text (the Chat form has no refusal part)
         const json::Value *r = part.find("refusal");
         if (!is_string(r)) bad(param, "'" + path + ".refusal' must be a string");
-        return r->as_string(path + ".refusal");
+        text += r->as_string(path + ".refusal");
+        if (parts) {
+            json::Value tp = json::Value::object();
+            tp.set("type", json::Value::string("text"));
+            tp.set("text", *r);
+            parts->push_back(std::move(tp));
+        }
+        return;
     }
-    if (t == "input_image") bad(param, "'" + path + "' is an image part: " +
-                                           "image input lands with vision passthrough on this route (see docs/server.md)");
+    if (t == "input_image") {
+        if (!allow_images)
+            bad(param, "'" + path + "' is an image part: images are served in user message content only");
+        if (!vision_enabled)
+            bad(param, "'" + path + "' is an image part: this server runs without a vision tower (config vision)"
+                              " - images are not served");
+        if (part.find("file_id"))
+            bad(param, "'" + path + ".file_id' is not served: this server stores no files (stateless Responses) -"
+                              " send image_url with a data: URL");
+        const json::Value *iu = part.find("image_url");
+        std::string url;
+        if (iu && iu->is_string()) url = iu->as_string(path + ".image_url");
+        else if (iu && iu->is_object() && iu->find("url") && iu->find("url")->is_string())
+            url = iu->find("url")->as_string(path + ".image_url.url");
+        else
+            bad(param, "'" + path + "' needs image_url (a data: URL string): the server fetches nothing, so"
+                              " remote image URLs are not served");
+        if (const json::Value *d = part.find("detail")) {
+            const std::string &ds = get_string(*d, param, path + ".detail");
+            if (ds != "auto" && ds != "low" && ds != "high")
+                bad(param, "'" + path + ".detail' must be \"auto\", \"low\" or \"high\", got '" + ds + "'");
+        }
+        try {
+            images.push_back(vision::parse_data_url(url, path));  // the Chat pipeline's one data-URL rule
+        } catch (const Error &e) {
+            bad(param, e.what());
+        }
+        has_image = true;
+        if (parts) {
+            json::Value ip = json::Value::object();
+            ip.set("type", json::Value::string("image_url"));
+            json::Value iu_obj = json::Value::object();
+            iu_obj.set("url", json::Value::string(url));
+            ip.set("image_url", std::move(iu_obj));
+            parts->push_back(std::move(ip));
+        }
+        return;
+    }
     if (t == "input_file" || t == "input_audio" || t == "audio" || t == "video")
-        bad(param, "'" + path + "' is a '" + t + "' part: only text parts are served");
+        bad(param, "'" + path + "' is a '" + t + "' part: only text and (user, vision) image parts are served");
     bad(param, "'" + path + ".type' is unrecognized: '" + t + "'");
 }
 
-// One input item -> a chat message {role, content} (text form). Message items are the STORY-02 surface; the
-// history kinds (function_call, tool outputs, reasoning) join at their stories with explicit rejections until then.
-json::Value normalize_item(const json::Value &item, size_t k) {
+// Text-only view of a part (tool-output content: an image there is a named refusal, never a drop).
+std::string part_text(const json::Value &part, const std::string &param, const std::string &path) {
+    std::vector<vision::ParsedImage> none;
+    std::string text;
+    bool ignored = false;
+    normalize_part(part, param, path, /*vision_enabled=*/true, /*allow_images=*/false, none, text, nullptr, ignored);
+    return text;
+}
+
+json::Value normalize_item(const json::Value &item, size_t k, bool vision_enabled,
+                          std::vector<vision::ParsedImage> &images) {
     const std::string path = "input[" + std::to_string(k) + "]";
     if (!item.is_object()) bad("input", "'" + path + "' must be an object, got " + std::string(json::type_name(item.type())));
     const json::Value *type = item.find("type");
@@ -108,7 +174,19 @@ json::Value normalize_item(const json::Value &item, size_t k) {
     } else if (content->is_string()) {
         text = content->as_string(path + ".content");
     } else if (content->is_array()) {
-        for (size_t p = 0; p < content->as_array("content").size(); ++p) text += part_text(content->as_array("content")[p], "input", path + ".content[" + std::to_string(p) + "]");
+        std::vector<json::Value> parts;
+        bool has_image = false;
+        for (size_t p = 0; p < content->as_array("content").size(); ++p)
+            normalize_part(content->as_array("content")[p], "input", path + ".content[" + std::to_string(p) + "]",
+                           vision_enabled, chat_role == "user", images, text, &parts, has_image);
+        if (has_image) {
+            json::Value msg = json::Value::object();
+            msg.set("role", json::Value::string(chat_role));
+            json::Value arr = json::Value::array();
+            for (json::Value &part : parts) arr.push(part);  // document order: text and images as sent
+            msg.set("content", std::move(arr));
+            return msg;
+        }
     } else {
         bad("input", "'" + path + ".content' must be a string, an array of content parts, or null, got " +
                          std::string(json::type_name(content->type())));
@@ -384,7 +462,7 @@ void parse_tools(const json::Value *tools, ResponsesRequest &r, const std::strin
 }  // namespace
 
 ResponsesRequest parse_responses_request(const json::Value &body, const SamplingParams &defaults,
-                                         const std::string &served_model_id) {
+                                         const std::string &served_model_id, bool vision_enabled) {
     if (!body.is_object())
         bad("", "the request body must be a JSON object, got " + std::string(json::type_name(body.type())));
     ResponsesRequest r;
@@ -483,13 +561,33 @@ ResponsesRequest parse_responses_request(const json::Value &body, const Sampling
         }
     }
     if (const json::Value *v = field(body, "text")) {
-        // The structured-output surface joins grammar enforcement at its story (docs/server.md); plain text is
-        // what this build produces, so anything else is a named refusal, never a silent downgrade.
+        // Structured output lands on the Chat pipeline's own response_format fields - the same grammar
+        // compiler, the same cache, the same keyword-level refusals (HttpServer compiles it on the HTTP
+        // thread; a schema the compiler cannot enforce is a 400 naming the keyword). Enforcement is real:
+        // "strict" is accepted as the shape's marker, not as a promise (the grammar constrains the output
+        // whether the client asked strictly or not).
         const json::Value *fmt = v->is_object() ? v->find("format") : nullptr;
         if (!fmt || !fmt->is_object()) bad("text", "'text' must be an object with a 'format' object");
         const json::Value *ftype = fmt->find("type");
-        if (!(is_string(ftype) && ftype->as_string("type") == "text"))
-            bad("text", "'text.format.type': only \"text\" is served (structured output: docs/server.md)");
+        if (!is_string(ftype)) bad("text", "'text.format.type' must be a string");
+        const std::string &ft = ftype->as_string("text.format.type");
+        if (ft == "text") {
+            r.chat.response_format = ChatRequest::ResponseFormat::Text;
+        } else if (ft == "json_object") {
+            r.chat.response_format = ChatRequest::ResponseFormat::JsonObject;  // any JSON object (the Chat grammar)
+        } else if (ft == "json_schema") {
+            const json::Value *schema = fmt->find("schema");
+            if (!schema) bad("text", "'text.format.json_schema' needs a 'schema' (an object)");
+            if (!schema->is_object())
+                bad("text", "'text.format.schema' must be an object, got " + std::string(json::type_name(schema->type())));
+            r.chat.response_format = ChatRequest::ResponseFormat::JsonSchema;
+            r.chat.response_schema = *schema;
+            if (const json::Value *nm = fmt->find("name"))
+                r.chat.response_schema_name = get_string(*nm, "text", "text.format.name");
+            if (const json::Value *st = fmt->find("strict")) get_bool(*st, "text", "text.format.strict");
+        } else {
+            bad("text", "'text.format.type': \"" + ft + "\" is not served (text, json_object, json_schema)");
+        }
     }
     if (const json::Value *v = field(body, "truncation")) {
         const std::string t = get_string(*v, "truncation", "truncation");
@@ -578,7 +676,7 @@ ResponsesRequest parse_responses_request(const json::Value &body, const Sampling
             if (!st.pending.empty())
                 bad("input", "input[" + std::to_string(k) + "]: the tool call '" + st.pending.begin()->first +
                                  "' has no output before this message (unpaired)");
-            json::Value m = normalize_item(item, k);
+            json::Value m = normalize_item(item, k, vision_enabled, r.chat.images);
             const std::string role = m.find("role")->as_string("role");
             if (role == "user") has_user = true;
             if (role == "assistant") {  // a following call joins this assistant turn (their item order is kept)

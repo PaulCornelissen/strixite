@@ -123,6 +123,72 @@ std::string sampling_text(const SamplingParams &s, bool seeded, const std::vecto
 
 }  // namespace
 
+// The Chat route's image pipeline, extracted verbatim for the Responses route (see the declaration).
+void HttpServer::apply_vision(int64_t id, const httplib::Request &req, ChatRequest &cr, GenerationRequest &gen,
+                              std::string &vision_note, bool &clamped) {
+    (void)req;
+    // The image pipeline: decode + resize + pack on this thread for every image the server hasn't
+    // decoded before (a repeat takes its grid from vision_memo_ and keeps its bytes - the engine
+    // decodes it only if its prefill reaches the block), the template's single pad expanded to each
+    // image's merged rows, and the mRoPE walk + the cache-key stream.
+    // Every failure here is the client's image (a 400 naming what was expected).
+    if (cfg_.vision == nullptr)
+        throw ApiError(400, "image parts need the server's vision tower (config vision)", "messages");
+    // The transient-RAM bound first, before any bytes decode (serve/vision_request.hpp
+    // PreprocessGate): all slots held is a server-load refusal (503, retryable), not the
+    // client's error. The slot releases when the vision block below unwinds.
+    vision::PreprocessGate::Slot preprocess_slot;
+    try {
+        preprocess_slot = vision_gate_.acquire(cfg_.vision_preprocess_limit);
+    } catch (const Error &e) {  // the handler logs it and answers 503 (same wire as before)
+        throw ApiError(503, e.what(), "messages", "server_error");
+    }
+    try {
+        std::vector<vision::ServedImage> images = vision::prepare_images(std::move(cr.images), *cfg_.vision,
+                                                                          &vision_memo_);
+        int64_t decoded = 0;
+        for (const vision::ServedImage &im : images) decoded += !im.prefill.pixel_values.empty();
+        std::vector<int64_t> counts;
+        counts.reserve(images.size());
+        for (const vision::ServedImage &im : images) counts.push_back(im.merged_tokens);
+        const int64_t pre_tokens = (int64_t)gen.prompt.size();
+        gen.prompt = vision::expand_image_pads(gen.prompt, cfg_.vision->image_token_id, counts);
+        vision::VisionPromptPlan plan =
+            vision::plan_vision_prompt(gen.prompt, images, cfg_.vision->cfg,
+                                       cfg_.vision->image_token_id, engine_.backend().max_positions());
+        gen.image_pos3 = std::move(plan.pos3);
+        gen.cache_key = std::move(plan.cache_prompt);
+        gen.prefill_images.clear();
+        for (vision::ServedImage &im : images)
+            gen.prefill_images.push_back(PrefillImage{std::move(im.prefill), im.row_start, im.rows});
+        // An image block is forwarded whole in one forward (the session's forward limit is
+        // the chunk size): a server configured with a tiny chunk cannot serve big images.
+        const int64_t max_block = engine_.backend().max_chunk();
+        for (const PrefillImage &im : gen.prefill_images)
+            if (im.rows > max_block)
+                throw ApiError(400,
+                               cat("the image expands to ", im.rows, " rows, past this server's "
+                                   "forward chunk of ", max_block, " (config chunk) - it cannot "
+                                   "be forwarded in one piece"),
+                               "messages");
+        if (pre_tokens != gen.prompt.size())
+            vision_note = std::to_string((long long)images.size()) +
+                          (images.size() == 1 ? " image (" : " images (") +
+                          std::to_string((long long)decoded) + " decoded, " +
+                          std::to_string((long long)(images.size() - decoded)) + " known), " +
+                          std::to_string((long long)plan.merged_rows_total) + " expanded rows (prompt " +
+                          std::to_string((long long)pre_tokens) + " -> " +
+                          std::to_string((long long)gen.prompt.size()) + " tokens, rope positions to " +
+                          std::to_string((long long)plan.rope_positions_reached) + ")";
+        gen.max_tokens = clamp_max_tokens(cr.max_tokens, (int64_t)gen.prompt.size(), engine_.capacity(),
+                                          clamped);
+    } catch (const Error &e) {
+        throw ApiError(400, e.what(), "messages");
+    } catch (const std::exception &e) {
+        throw ApiError(400, e.what(), "messages");
+    }
+}
+
 HttpServer::HttpServer(Engine &engine, const Tokenizer &tok, ServerConfig cfg)
     : engine_(engine), tok_(tok), cfg_(std::move(cfg)), started_(unix_now()), svr_(std::make_unique<httplib::Server>()) {
     STRIX_CHECK(cfg_.port >= 0 && cfg_.port <= 65535, "HttpServer: port ", cfg_.port);
@@ -234,69 +300,7 @@ void HttpServer::routes() {
                 gen.prompt = tok_.encode(prompt, plain_spans);
                 gen.max_tokens = clamp_max_tokens(cr.max_tokens, (int64_t)gen.prompt.size(), engine_.capacity(), clamped);
             }
-            if (vision) {
-                // The image pipeline: decode + resize + pack on this thread for every image the server hasn't
-                // decoded before (a repeat takes its grid from vision_memo_ and keeps its bytes - the engine
-                // decodes it only if its prefill reaches the block), the template's single pad expanded to each
-                // image's merged rows, and the mRoPE walk + the cache-key stream.
-                // Every failure here is the client's image (a 400 naming what was expected).
-                if (cfg_.vision == nullptr)
-                    throw ApiError(400, "image parts need the server's vision tower (config vision)", "messages");
-                // The transient-RAM bound first, before any bytes decode (serve/vision_request.hpp
-                // PreprocessGate): all slots held is a server-load refusal (503, retryable), not the
-                // client's error. The slot releases when the vision block below unwinds.
-                vision::PreprocessGate::Slot preprocess_slot;
-                try {
-                    preprocess_slot = vision_gate_.acquire(cfg_.vision_preprocess_limit);
-                } catch (const Error &e) {
-                    log_error(id, req, 503, e.what());
-                    return send_error(res, 503, e.what(), "server_error", "messages");
-                }
-                try {
-                    std::vector<vision::ServedImage> images = vision::prepare_images(std::move(cr.images), *cfg_.vision,
-                                                                                      &vision_memo_);
-                    int64_t decoded = 0;
-                    for (const vision::ServedImage &im : images) decoded += !im.prefill.pixel_values.empty();
-                    std::vector<int64_t> counts;
-                    counts.reserve(images.size());
-                    for (const vision::ServedImage &im : images) counts.push_back(im.merged_tokens);
-                    const int64_t pre_tokens = (int64_t)gen.prompt.size();
-                    gen.prompt = vision::expand_image_pads(gen.prompt, cfg_.vision->image_token_id, counts);
-                    vision::VisionPromptPlan plan =
-                        vision::plan_vision_prompt(gen.prompt, images, cfg_.vision->cfg,
-                                                   cfg_.vision->image_token_id, engine_.backend().max_positions());
-                    gen.image_pos3 = std::move(plan.pos3);
-                    gen.cache_key = std::move(plan.cache_prompt);
-                    gen.prefill_images.clear();
-                    for (vision::ServedImage &im : images)
-                        gen.prefill_images.push_back(PrefillImage{std::move(im.prefill), im.row_start, im.rows});
-                    // An image block is forwarded whole in one forward (the session's forward limit is
-                    // the chunk size): a server configured with a tiny chunk cannot serve big images.
-                    const int64_t max_block = engine_.backend().max_chunk();
-                    for (const PrefillImage &im : gen.prefill_images)
-                        if (im.rows > max_block)
-                            throw ApiError(400,
-                                           cat("the image expands to ", im.rows, " rows, past this server's "
-                                               "forward chunk of ", max_block, " (config chunk) - it cannot "
-                                               "be forwarded in one piece"),
-                                           "messages");
-                    if (pre_tokens != gen.prompt.size())
-                        vision_note = std::to_string((long long)images.size()) +
-                                      (images.size() == 1 ? " image (" : " images (") +
-                                      std::to_string((long long)decoded) + " decoded, " +
-                                      std::to_string((long long)(images.size() - decoded)) + " known), " +
-                                      std::to_string((long long)plan.merged_rows_total) + " expanded rows (prompt " +
-                                      std::to_string((long long)pre_tokens) + " -> " +
-                                      std::to_string((long long)gen.prompt.size()) + " tokens, rope positions to " +
-                                      std::to_string((long long)plan.rope_positions_reached) + ")";
-                    gen.max_tokens = clamp_max_tokens(cr.max_tokens, (int64_t)gen.prompt.size(), engine_.capacity(),
-                                                      clamped);
-                } catch (const Error &e) {
-                    throw ApiError(400, e.what(), "messages");
-                } catch (const std::exception &e) {
-                    throw ApiError(400, e.what(), "messages");
-                }
-            }
+            if (!cr.images.empty()) apply_vision(id, req, cr, gen, vision_note, clamped);
         } catch (const ApiError &e) {
             log_error(id, req, e.status, e.what());
             return send_error(res, e.status, e.what(), e.type, e.param);
@@ -461,6 +465,7 @@ void HttpServer::routes() {
         ResponsesRequest rr;
         GenerationRequest gen;
         bool clamped = false;
+        std::string format_row, vision_note;  // the log rows of a grammar request / an image request
         try {
             json::Value body;
             try {
@@ -468,16 +473,17 @@ void HttpServer::routes() {
             } catch (const Error &e) {
                 throw ApiError(400, std::string("request body: ") + e.what());
             }
-            rr = parse_responses_request(body, cfg_.defaults, cfg_.model_id);
+            rr = parse_responses_request(body, cfg_.defaults, cfg_.model_id, /*vision_enabled=*/cfg_.vision != nullptr);
             // The server's thinking default for a request that named no reasoning effort (as the Chat route).
             if (!cfg_.thinking_default && !rr.chat.template_options.enable_thinking.has_value() &&
                 !thinking_requested(rr.chat))
                 rr.chat.template_options.enable_thinking = false;
             std::string prompt;
             std::vector<std::pair<size_t, size_t>> plain_spans;  // what the request wrote: never control tokens
+            const bool vision = !rr.chat.images.empty();  // image parts (parsed only when the server has a tower)
             try {
                 prompt = render_chat(rr.chat.messages, rr.chat.tools.is_null() ? nullptr : &rr.chat.tools,
-                                     rr.chat.template_options, &plain_spans);
+                                     rr.chat.template_options, &plain_spans, vision);
             } catch (const Error &e) {
                 throw ApiError(400, e.what(), "input");
             }
@@ -492,7 +498,7 @@ void HttpServer::routes() {
                 rr.chat.template_options.enable_thinking = false;
                 try {
                     prompt = render_chat(rr.chat.messages, rr.chat.tools.is_null() ? nullptr : &rr.chat.tools,
-                                         rr.chat.template_options, &plain_spans);
+                                         rr.chat.template_options, &plain_spans, vision);
                 } catch (const Error &e) {
                     throw ApiError(400, e.what(), "input");
                 }
@@ -500,6 +506,29 @@ void HttpServer::routes() {
                 gen.max_tokens = clamp_max_tokens(rr.chat.max_tokens, (int64_t)gen.prompt.size(), engine_.capacity(),
                                                    clamped);
             }
+            // Structured output (text.format): the Chat route's own grammar compile - the same cache, the same
+            // keyword-level 400s naming what the compiler cannot enforce. Enforcement is the grammar, real.
+            if (rr.chat.response_format != ChatRequest::ResponseFormat::Text) {
+                const int64_t misses = grammars_.misses();
+                try {
+                    gen.grammar = rr.chat.response_format == ChatRequest::ResponseFormat::JsonObject
+                                      ? grammars_.any_object()
+                                      : grammars_.schema(rr.chat.response_schema, "text.format.schema");
+                } catch (const Error &e) {
+                    // The check's own prefix (function, file:line, condition) goes to the log; the client gets the reason.
+                    const std::string full = e.what();
+                    const size_t at = full.find("failed: ");
+                    throw ApiError(400, at == std::string::npos ? full : full.substr(at + 8), "text.format");
+                }
+                format_row = std::string(rr.chat.response_format == ChatRequest::ResponseFormat::JsonObject
+                                              ? "json_object"
+                                              : "json_schema") +
+                             (rr.chat.response_schema_name.empty() ? "" : " '" + rr.chat.response_schema_name + "'") +
+                             " (grammar " + (grammars_.misses() > misses ? "compiled" : "cached") + ", " +
+                             fmt_n(grammars_.size()) + " cached)";
+            }
+            // Images (STORY-11): the Chat route's pipeline, verbatim - same pad expansion, mRoPE walk, memo.
+            if (vision) apply_vision(id, req, rr.chat, gen, vision_note, clamped);
         } catch (const ApiError &e) {
             log_error(id, req, e.status, e.what());
             return send_error(res, e.status, e.what(), e.type, e.param);
@@ -509,6 +538,8 @@ void HttpServer::routes() {
         }
         gen.log_header = header_rows(req, rr.chat.stream, rr.chat.model);
         gen.log_header.emplace_back("route", "responses");
+        if (!format_row.empty()) gen.log_header.emplace_back("format", format_row);
+        if (!vision_note.empty()) gen.log_header.emplace_back("vision", vision_note);
         gen.id = id;
         gen.stream = rr.chat.stream;
         if (!rr.chat.seeded) rr.chat.sampling.seed = std::random_device{}();

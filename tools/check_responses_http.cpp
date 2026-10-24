@@ -522,6 +522,83 @@ void check_routes(httplib::Client &cli, const std::string &model_id, const Token
                "live body invariants: summary [], encrypted_content null, reasoning_text raw");
         }
     }
+    {  // Structured output on the Responses wire (STORY-11): text.format json_object compiles the Chat
+       // route's grammar (same cache, same enforcement) and the scripted JSON answer passes through.
+       // max_output_tokens 128: thinking is left out (the Chat rule) - the grammar constrains the answer.
+        std::vector<int32_t> json_script;
+        for (char c : std::string_view("{\"answer\": 42}")) json_script.push_back(tok.byte_token((uint8_t)c));
+        json_script.push_back(im_end);
+        be.set_script(json_script);
+        auto res = cli.Post("/v1/responses",
+                            "{\"model\":\"" + model_id + "\",\"input\":\"json\",\"max_output_tokens\":128,"
+                            "\"text\":{\"format\":{\"type\":\"json_object\"}}}",
+                            "application/json");
+        ok(res && res->status == 200, "json_object request -> 200, got ", res ? std::to_string(res->status) : "none",
+           res ? " body " + res->body.substr(0, 220) : "");
+        if (res && res->status == 200) {
+            json::Value b = json::Value::parse(res->body);
+            ok(b.find("status")->as_string("st") == "completed", "the grammar turn completes");
+            std::string text;
+            for (const auto &it : b.find("output")->as_array("o"))
+                if (it.find("type")->as_string("t") == "message")
+                    for (const auto &p : it.find("content")->as_array("c")) text += p.find("text")->as_string("x");
+            ok(text == "{\"answer\": 42}", "the scripted JSON object passed through the grammar intact, got '",
+               text, "'");
+        }
+    }
+    {  // Enforcement is real: the scripted answer tries the WRONG key (schema requires "answer", no extra
+       // properties) - the grammar masks every illegal token, so the turn can only complete schema-valid.
+        std::vector<int32_t> rogue;
+        for (char c : std::string_view("{\"nope\": 1}")) rogue.push_back(tok.byte_token((uint8_t)c));
+        rogue.push_back(im_end);
+        be.set_script(rogue);
+        auto res = cli.Post("/v1/responses",
+                            "{\"model\":\"" + model_id + "\",\"input\":\"json\",\"max_output_tokens\":128,"
+                            "\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"ans\",\"schema\":"
+                            "{\"type\":\"object\",\"properties\":{\"answer\":{\"type\":\"integer\"}},"
+                            "\"required\":[\"answer\"],\"additionalProperties\":false}}}}",
+                            "application/json");
+        ok(res && res->status == 200, "the masked turn completes (200), got ",
+           res ? std::to_string(res->status) : "none", res ? " body " + res->body.substr(0, 220) : "");
+        if (res && res->status == 200) {
+            json::Value b = json::Value::parse(res->body);
+            std::string text;
+            for (const auto &it : b.find("output")->as_array("o"))
+                if (it.find("type")->as_string("t") == "message")
+                    for (const auto &p : it.find("content")->as_array("c")) text += p.find("text")->as_string("x");
+            bool valid = true;
+            json::Value out;
+            try {
+                out = json::Value::parse(text);
+            } catch (const Error &) {
+                valid = false;
+            }
+            ok(valid && out.is_object() && out.find("answer") && !out.find("nope"),
+               "the model could NOT emit the illegal key - the answer is schema-valid ('", text, "')");
+        }
+    }
+    {  // A schema the grammar compiler cannot enforce is a 400 naming the keyword and text.format.
+        auto res = cli.Post("/v1/responses",
+                            "{\"model\":\"" + model_id + "\",\"input\":\"json\",\"text\":{\"format\":"
+                            "{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\",\"uniqueItems\":true}}}}",
+                            "application/json");
+        ok(res && res->status == 400, "an unenforceable schema -> 400, got ",
+           res ? std::to_string(res->status) : "none");
+        ok(res && err_field(*res, "param").as_string("p") == "text.format", "the 400 names 'text.format'");
+        ok(res && res->body.find("uniqueItems") != std::string::npos, "the refusal names the keyword");
+    }
+    {  // Vision off (this server): an image part is a named refusal on the wire, never a silent drop.
+        be.set_script(text_script);
+        auto res = cli.Post("/v1/responses",
+                            "{\"model\":\"" + model_id + "\",\"input\":[{\"role\":\"user\",\"content\":"
+                            "[{\"type\":\"input_text\",\"text\":\"look\"},{\"type\":\"input_image\",\"image_url\":"
+                            "\"data:image/png;base64,aGk=\"}]}]}",
+                            "application/json");
+        ok(res && res->status == 400, "input_image on a vision-off server -> 400, got ",
+           res ? std::to_string(res->status) : "none");
+        ok(res && err_field(*res, "param").as_string("p") == "input", "the refusal names 'input'");
+        ok(res && res->body.find("vision tower") != std::string::npos, "the refusal explains the tower");
+    }
     {  // Chat untouched: any model name is served (the model refusal above is Responses-only), the scripted
        // answer comes back as Chat content with real usage.
         be.set_script(text_script);  // re-arm after the reasoning scripts

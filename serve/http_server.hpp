@@ -7,6 +7,7 @@
 // cancels its request.
 
 #include "serve/engine.hpp"
+#include "serve/openai.hpp"  // ChatRequest (apply_vision's argument)
 #include "serve/grammar_cache.hpp"
 #include "serve/tokenizer.hpp"
 #include "serve/vision_request.hpp"
@@ -16,6 +17,7 @@
 #include <string>
 
 namespace httplib {
+class Request;
 class Server;
 }
 
@@ -57,6 +59,12 @@ public:
     void stop();
 
 private:
+    // The image pipeline on a rendered prompt (decode/resize/pack, pad expansion, the mRoPE walk, the cache
+    // key). Shared verbatim by the Chat and the Responses route: images reach the engine the same way on both
+    // wires; every refusal names the client's part (400) or the server's load (503, retryable).
+    void apply_vision(int64_t id, const httplib::Request &req, ChatRequest &cr, GenerationRequest &gen,
+                      std::string &vision_note, bool &clamped);
+
     Engine &engine_;
     const Tokenizer &tok_;
     ServerConfig cfg_;

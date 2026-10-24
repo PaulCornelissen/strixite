@@ -169,6 +169,187 @@ void check_negatives(const json::Value &fixture) {
     ok(none.tool_registry.as_array("tool_registry").size() == 9, "tool_choice none: the registry stays complete");
 }
 
+
+// --- STORY-11: structured output (text.format) and image parts (the vision passthrough rules) ---------------
+// text.format lands on the Chat pipeline's response_format fields (the grammar compiles on the route - the
+// wire proof is in check_responses_http; here: the normalization). Image parts: data URLs reach the Chat
+// image pipeline IN ORDER when the server has a tower; everything else (no tower, remote URLs, file ids,
+// non-user content, audio/video) is a named refusal - never a silent drop, and the server fetches nothing.
+
+std::string err_param_of(const std::string &body, int *status, std::string *msg, bool vision = false) {
+    try {
+        parse_responses_request(json::Value::parse(body), kDefaults, kModel, vision);
+        if (status) *status = 0;
+        return {};
+    } catch (const ApiError &e) {
+        if (status) *status = e.status;
+        if (msg) *msg = e.what();
+        return e.param;
+    } catch (const Error &e) {
+        ok(false, "test body is not valid JSON: ", body);
+        if (status) *status = -1;
+        return "BAD-BODY";
+    }
+}
+
+ResponsesRequest pres(const std::string &body, bool vision = false) {
+    json::Value v;
+    try {
+        v = json::Value::parse(body);
+    } catch (const Error &e) {
+        ok(false, "test body is not valid JSON (byte ", ((const std::string &)e.what()).size(), "): ", body);
+        throw;
+    }
+    return parse_responses_request(v, kDefaults, kModel, vision);
+}
+
+void check_structured_and_images() {
+    const std::string m = kModel;
+    const std::string pre = "{\"model\":\"" + m + "\",\"input\":\"q\"";
+    {  // the format table -> the Chat fields (the same compile site, the same enforcement)
+        ok(pres(pre + ",\"text\":{\"format\":{\"type\":\"text\"}}}").chat.response_format ==
+               ChatRequest::ResponseFormat::Text,
+           "format text stays Text");
+        ok(pres(pre + ",\"text\":{\"format\":{\"type\":\"json_object\"}}}").chat.response_format ==
+               ChatRequest::ResponseFormat::JsonObject,
+           "json_object maps to the Chat json_object grammar mode");
+        ResponsesRequest r = pres(pre + ",\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"ans\","
+                                             "\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":"
+                                             "{\"answer\":{\"type\":\"integer\"}},\"required\":[\"answer\"]}}}}");
+        ok(r.chat.response_format == ChatRequest::ResponseFormat::JsonSchema, "json_schema maps");
+        ok(r.chat.response_schema_name == "ans", "the schema name carries over");
+        ok(r.chat.response_schema.find("properties")->find("answer")->find("type")->as_string("t") == "integer",
+           "the schema object carries over intact");
+    }
+    {  // format-shape refusals (param text)
+        int st = 0;
+        std::string msg;
+        ok(err_param_of(pre + ",\"text\":{\"format\":{\"type\":\"json_schema\"}}}", &st, &msg) == "text" && st == 400,
+           "json_schema without a schema -> 400 text");
+        ok(err_param_of(pre + ",\"text\":{\"format\":{\"type\":\"json_schema\",\"schema\":[1]}}}", &st, &msg) ==
+                   "text" &&
+               st == 400,
+           "a non-object schema -> 400 text");
+        ok(err_param_of(pre + ",\"text\":{\"format\":{\"type\":\"json_schema\",\"schema\":{},\"strict\":\"yes\"}}}",
+                        &st, &msg) == "text" &&
+                   st == 400,
+           "strict must be a bool");
+        ok(err_param_of(pre + ",\"text\":{\"format\":{\"type\":\"json_schema\",\"schema\":{},\"name\":42}}}", &st,
+                        &msg) == "text" &&
+                   st == 400,
+           "name must be a string");
+        std::string p = err_param_of(pre + ",\"text\":{\"format\":{\"type\":\"grammar\"}}}", &st, &msg);
+        ok(p == "text" && st == 400 && msg.find("json_object") != std::string::npos,
+           "an unknown format type names the served set, got: ", msg);
+        ok(err_param_of(pre + ",\"text\":{\"format\":\"text\"}}", &st, &msg) == "text" && st == 400,
+           "format must be an object");
+    }
+    // --- images -------------------------------------------------------------------------------
+    const char *kData = "data:image/png;base64,aGk=";   // the bytes "hi"
+    const char *kData2 = "data:image/png;base64,YWJj";  // the bytes "abc"
+    {
+        int st = 0;
+        std::string msg;
+        std::string p = err_param_of("{\"model\":\"" + m + "\",\"input\":[{\"role\":\"user\",\"content\":["
+                                     "{\"type\":\"input_text\",\"text\":\"look\"},{\"type\":\"input_image\",\"image_url\":\"" +
+                                         std::string(kData) + "\"}]}]}",
+                                     &st, &msg, /*vision=*/false);
+        ok(p == "input" && st == 400 && msg.find("vision tower") != std::string::npos,
+           "no tower: an image part is a named refusal (never a silent drop), got: ", msg);
+    }
+    {
+        ResponsesRequest r = pres("{\"model\":\"" + m + "\",\"input\":[{\"role\":\"user\",\"content\":["
+                                 "{\"type\":\"input_text\",\"text\":\"look\"},{\"type\":\"input_image\",\"image_url\":\"" +
+                                     std::string(kData) + "\",\"detail\":\"high\"}]}]}",
+                                 /*vision=*/true);
+        ok(r.chat.images.size() == 1, "the image reached the Chat pipeline");
+        ok(r.chat.images[0].bytes == std::vector<uint8_t>({'h', 'i'}), "the data URL decoded (bytes 'hi')");
+        ok(r.chat.images[0].mime == "image/png", "the mime carried over");
+        const json::Value &msg = r.chat.messages.as_array("messages")[0];
+        ok(msg.find("content")->is_array(), "an image message keeps its parts (array content)");
+        const std::vector<json::Value> &parts = msg.find("content")->as_array("content");
+        ok(parts.size() == 2 && parts[0].find("type")->as_string("t") == "text" &&
+                   parts[1].find("type")->as_string("t") == "image_url" &&
+                   parts[1].find("image_url")->find("url")->as_string("u") == kData,
+           "text then image, the data URL intact (the Chat shape the template renders)");
+    }
+    {  // ordering: text, image, text inside one item, then a second item with two images
+        ResponsesRequest r = pres("{\"model\":\"" + m + "\",\"input\":["
+                                 "{\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"},"
+                                 "{\"type\":\"input_image\",\"image_url\":\"" + std::string(kData) + "\"},"
+                                 "{\"type\":\"input_text\",\"text\":\"b\"}]},"
+                                 "{\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":"
+                                 "{\"url\":\"" + std::string(kData2) + "\"}}]}]}",
+                                 true);
+        ok(r.chat.images.size() == 2, "both images collected, document order");
+        ok(r.chat.images[0].bytes == std::vector<uint8_t>({'h', 'i'}) &&
+                   r.chat.images[1].bytes == std::vector<uint8_t>({'a', 'b', 'c'}),
+           "images ordered by (item, part): hi then abc (the lax image_url.url shape accepted)");
+        const std::vector<json::Value> &parts =
+            r.chat.messages.as_array("messages")[0].find("content")->as_array("content");
+        ok(parts.size() == 3 && parts[1].find("type")->as_string("t") == "image_url",
+           "the interleaving text-image-text is preserved as parts");
+    }
+    {
+        int st = 0;
+        std::string msg;
+        ok(err_param_of("{\"model\":\"" + m + "\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\","
+                        "\"image_url\":\"https://example.com/a.png\"}]}]}",
+                        &st, &msg, true) == "input" &&
+                   st == 400 && msg.find("data:") != std::string::npos &&
+                   msg.find("fetches nothing") != std::string::npos,
+           "remote URLs refused (the server fetches nothing), got: ", msg);
+        ok(err_param_of("{\"model\":\"" + m + "\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\","
+                        "\"file_id\":\"file_1\"}]}]}",
+                        &st, &msg, true) == "input" &&
+                   st == 400 && msg.find("file_id") != std::string::npos,
+           "file ids refused (stateless: no store)");
+        ok(err_param_of("{\"model\":\"" + m + "\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\","
+                        "\"image_url\":\"data:image/png;base64,zz!!\"}]}]}",
+                        &st, &msg, true) == "input" &&
+                   st == 400,
+           "a malformed base64 data URL refused");
+        ok(err_param_of("{\"model\":\"" + m + "\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_image\","
+                        "\"image_url\":\"" +
+                            std::string(kData) + "\",\"detail\":\"mega\"}]}]}",
+                        &st, &msg, true) == "input" &&
+                   st == 400 && msg.find("detail") != std::string::npos,
+           "detail validated");
+        ok(err_param_of("{\"model\":\"" + m + "\",\"input\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"input_image\","
+                        "\"image_url\":\"" +
+                            std::string(kData) + "\"}]}]}",
+                        &st, &msg, true) == "input" &&
+                   st == 400 && msg.find("user") != std::string::npos,
+           "images belong to user messages");
+        ok(err_param_of("{\"model\":\"" + m + "\",\"input\":[{\"role\":\"user\",\"content\":\"x\"},"
+                        "{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"f\",\"arguments\":\"{}\"},"
+                        "{\"type\":\"function_call_output\",\"call_id\":\"c1\",\"output\":[{\"type\":\"input_image\","
+                        "\"image_url\":\"" +
+                            std::string(kData) + "\"}]}]}",
+                        &st, &msg, true) == "input" &&
+                   st == 400,
+           "tool outputs are text content (an image there is refused, not dropped)");
+        ok(err_param_of("{\"model\":\"" + m + "\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_audio\","
+                        "\"input_audio\":{}}]}]}",
+                        &st, &msg, true) == "input" &&
+                   st == 400 && msg.find("audio") != std::string::npos,
+           "audio refused, named");
+    }
+    {  // parity: the same data URL through the Chat parser and this one decodes identically
+        ResponsesRequest rr = pres("{\"model\":\"" + m + "\",\"input\":[{\"role\":\"user\",\"content\":["
+                                  "{\"type\":\"input_image\",\"image_url\":\"" +
+                                      std::string(kData2) + "\"}]}]}",
+                                  true);
+        ChatRequest cr = parse_chat_request(json::Value::parse("{\"messages\":[{\"role\":\"user\",\"content\":["
+                                                               "{\"type\":\"image_url\",\"image_url\":{\"url\":\"" +
+                                                               std::string(kData2) + "\"}}]}]}"),
+                                            kDefaults, true);
+        ok(cr.images.size() == 1 && rr.chat.images.size() == 1 && cr.images[0].bytes == rr.chat.images[0].bytes &&
+                   cr.images[0].mime == rr.chat.images[0].mime,
+           "one data-URL rule serves both routes (byte-for-byte parity with the Chat parser)");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -177,6 +358,7 @@ int main(int argc, char **argv) {
         json::Value fixture = load_fixture(path);
         check_real_codex_request(fixture);
         check_negatives(fixture);
+        check_structured_and_images();
     } catch (const std::exception &e) {
         std::printf("FAIL (unhandled): %s\n", e.what());
         return 2;
