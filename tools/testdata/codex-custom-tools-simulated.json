@@ -1,0 +1,52 @@
+{
+ "_fixture": "SIMULATED Codex-style request for the custom (freeform) tool surface. The installed codex-cli 0.162.1 does NOT emit custom tools in `codex exec` mode (binary inspection: feature-gated `apply_patch_freeform`, model-catalog `apply_patch_tool_type`; exec captures show only function/namespace/hosted tools). Shape: ResponseItem strings `custom_tool_call`/`custom_tool_call_output` with `input`/`call_id` fields observed in the installed binary; OpenAI Responses custom-tool spec (type/name/description/format.grammar{type,definition}). This file is a contract fixture, not captured traffic.",
+ "_label": "SIMULATED - labeled as such per the backlog's installed-client coverage rule",
+ "model": "qwen3.8-flash-next",
+ "stream": true,
+ "store": false,
+ "tool_choice": "auto",
+ "parallel_tool_calls": true,
+ "reasoning": {"effort": "medium", "summary": "auto"},
+ "include": ["reasoning.encrypted_content"],
+ "input": [
+  {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are a coding agent. Edit files with the apply_patch tool."}]},
+  {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Add a module docstring to notes.py."}]}
+ ],
+ "tools": [
+  {
+   "type": "custom",
+   "name": "apply_patch",
+   "description": "Update the sources by applying a patch in the freeform grammar below.",
+   "format": {
+    "type": "grammar",
+    "grammar": {
+     "type": "lark",
+     "definition": "start: begin_patch hunk+ end_patch\nbegin_patch: \"*** Begin Patch\" LF\nend_patch: \"*** End Patch\" LF?\nhunk: add_hunk | delete_hunk | update_hunk\nadd_hunk: \"*** Add File: \" filename LF add_line*\ndelete_hunk: \"*** Delete File: \" filename LF\nupdate_hunk: \"*** Update File: \" filename LF (move_path | hunk)*\nfilename: /(.|\\n)+/\n"
+    }
+   }
+  },
+  {
+   "type": "function",
+   "name": "exec_command",
+   "description": "Runs a command in a PTY, returning output or a session ID for ongoing interaction.",
+   "strict": false,
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "cmd": {"type": "string", "description": "Shell command to execute."},
+     "workdir": {"type": "string", "description": "Working directory. Defaults to the user's cwd."}
+    },
+    "required": ["cmd"]
+   }
+  },
+  {
+   "type": "namespace",
+   "name": "multi_agent_v1",
+   "description": "Tools for spawning and driving subagents.",
+   "tools": [
+    {"type": "function", "name": "spawn_agent", "description": "Spawn a new agent.", "strict": false,
+     "parameters": {"type": "object", "properties": {"task": {"type": "string"}}, "required": ["task"]}}
+   ]
+  }
+ ]
+}

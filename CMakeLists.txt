@@ -268,6 +268,10 @@ target_link_libraries(check_responses_norm PRIVATE strix_serve)
 add_executable(check_responses_tools tools/check_responses_tools.cpp)
 target_link_libraries(check_responses_tools PRIVATE strix_serve)
 
+# The /v1/responses custom (freeform) tools: byte-for-byte input through the real parser, mixed formats, refusals.
+add_executable(check_responses_custom tools/check_responses_custom.cpp)
+target_link_libraries(check_responses_custom PRIVATE strix_serve)
+
 # The /v1/responses HTTP surface on a scripted backend (a synthetic tokenizer stands in for the model's), host
 # only: the route contract (400/501, never 404) and the untouched Chat route end to end without a GPU.
 add_executable(check_responses_http tools/check_responses_http.cpp)

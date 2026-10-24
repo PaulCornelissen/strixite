@@ -220,7 +220,7 @@ std::vector<NegCase> negative_cases() {
         {"background refused", body("\"input\":\"q\",\"background\":true"), "background"},
         {"previous_response_id refused (stateless)", body("\"input\":\"q\",\"previous_response_id\":\"resp_1\""), "previous_response_id"},
         {"top_k refused (not a Responses field)", body("\"input\":\"q\",\"top_k\":5"), "top_k"},
-        {"tools: custom freeform refused until STORY-05", body("\"input\":\"q\",\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\",\"format\":{\"type\":\"grammar\",\"grammar\":{\"definition\":\"lark x\",\"format\":\"lark\"}}}]"), "tools"},
+        {"tools: custom grammar without its type refused (malformed, named)", body("\"input\":\"q\",\"tools\":[{\"type\":\"custom\",\"name\":\"apply_patch\",\"format\":{\"type\":\"grammar\",\"grammar\":{\"definition\":\"lark x\",\"format\":\"lark\"}}}]"), "tools"},
         {"tools: hosted file_search refused (no hosted tools)", body("\"input\":\"q\",\"tools\":[{\"type\":\"file_search\"}]"), "tools"},
         {"tools: namespace with a nested namespace refused", body("\"input\":\"q\",\"tools\":[{\"type\":\"namespace\",\"name\":\"n1\",\"tools\":[{\"type\":\"namespace\",\"name\":\"n2\",\"tools\":[{\"type\":\"function\",\"name\":\"f\",\"parameters\":{\"type\":\"object\"}}]}]}]"), "tools"},
         {"tools: duplicate function names refused", body("\"input\":\"q\",\"tools\":[{\"type\":\"function\",\"name\":\"a\",\"parameters\":{\"type\":\"object\"}},{\"type\":\"function\",\"name\":\"a\",\"parameters\":{\"type\":\"object\"}}]"), "tools"},

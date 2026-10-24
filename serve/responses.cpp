@@ -195,8 +195,62 @@ void parse_tools(const json::Value *tools, ResponsesRequest &r, const std::strin
                                       r.tool_registry, names, "tools");
                 }
             } else if (tt == "custom") {
-                bad("tools", "'" + path + "' is a custom (freeform) tool: " +
-                                 "freeform tools land with their mapping on this route (docs/server.md)");
+                // A Codex freeform tool (apply_patch and friends): the model writes raw text, not JSON arguments.
+                // Internal form: a function tool with one required string parameter "input" - the output parser
+                // keeps string-typed parameter values raw (bytes: newlines, Unicode, patch boundaries intact).
+                const json::Value *nm = t.find("name");
+                if (!is_string(nm)) bad("tools", "'" + path + "' needs a string 'name'");
+                const std::string n = nm->as_string(path + ".name");
+                check_tool_name(n, "tools");
+                if (!names.insert(n).second) bad("tools", "duplicate tool name '" + n + "'");
+                // The format rides into the parameter description (what the model reads): validated shape,
+                // NOT enforced - this server has no Lark/regex runtime and never constrains the answer to it.
+                std::string format_text;
+                if (const json::Value *f = t.find("format")) {
+                    if (!f->is_object()) bad("tools", "'" + path + ".format' must be an object");
+                    const json::Value *ftype = f->find("type");
+                    if (!(is_string(ftype) && ftype->as_string("type") == "grammar"))
+                        bad("tools", "'" + path + ".format.type': only \"grammar\" is served, got '" +
+                                (is_string(ftype) ? ftype->as_string("type") : std::string(json::type_name(ftype->type()))) + "'");
+                    const json::Value *g = f->find("grammar");
+                    if (!g || !g->is_object()) bad("tools", "'" + path + ".format' needs a grammar object");
+                    const json::Value *gtype = g->find("type"), *def = g->find("definition");
+                    if (!is_string(gtype)) bad("tools", "'" + path + ".format.grammar.type' must be a string");
+                    if (!is_string(def) || def->as_string("definition").empty())
+                        bad("tools", "'" + path + ".format.grammar.definition' must be a non-empty string");
+                    format_text = "Raw input grammar (" + gtype->as_string("type") +
+                                  ", shown to the model; the server does not enforce it):\n" +
+                                  def->as_string("definition");
+                }
+                std::string desc;
+                if (is_string(t.find("description"))) desc = t.find("description")->as_string(path + ".description");
+                if (!desc.empty()) desc += "\n\n";
+                desc += format_text.empty() ? "Input is raw text passed to the client verbatim." : format_text;
+                json::Value props = json::Value::object();
+                json::Value input = json::Value::object();
+                input.set("type", json::Value::string("string"));
+                input.set("description", json::Value::string(std::move(desc)));
+                props.set("input", std::move(input));
+                json::Value params = json::Value::object();
+                params.set("type", json::Value::string("object"));
+                params.set("properties", std::move(props));
+                json::Value required = json::Value::array();
+                required.push(json::Value::string("input"));
+                params.set("required", std::move(required));
+                json::Value fn = json::Value::object();
+                fn.set("name", json::Value::string(n));
+                fn.set("description", json::Value::string(format_text.empty() ? "Raw-text tool " + n
+                                                                              : "Raw-text tool " + n + " (grammar shown in the input parameter)"));
+                fn.set("parameters", std::move(params));
+                json::Value entry = json::Value::object();
+                entry.set("type", json::Value::string("function"));
+                entry.set("function", std::move(fn));
+                chat_tools.push(std::move(entry));
+                json::Value reg = json::Value::object();
+                reg.set("external", json::Value::string(n));
+                reg.set("kind", json::Value::string("custom"));  // output: custom_tool_call, input byte-for-byte
+                reg.set("namespace", json::Value::string(""));  // top-level (a custom tool is never namespaced)
+                r.tool_registry.push(std::move(reg));
             } else if (tt == "web_search") {
                 // A hosted tool: this server executes none (no OpenAI backend). Dropped from the generator's
                 // view, disclosed in docs/server.md - the model can't call what it never sees, and the client
