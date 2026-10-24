@@ -301,6 +301,9 @@ struct GenerationRequest {
     int64_t max_tokens = 0;  // >= 1; prompt + max_tokens <= capacity (the API layer clamps)
     SamplingParams sampling;
     OutputParser::Config parser;  // parser.tools must outlive the request
+    // ... which is why the request OWNS the schema: a streaming handler returns while the engine runs, so a
+    // shared_ptr held by the handler alone frees the tools mid-parse (a use-after-free ASAN caught on this).
+    std::shared_ptr<json::Value> tools_owner;  // the storage parser.tools points into (null schema: parser.tools null)
     // Reasoning tokens allowed before the engine closes the think block itself (feeding kThinkingStop); -1 =
     // no budget. The API layer sets it (an explicit budget, or the answer room).
     int64_t thinking_budget = -1;

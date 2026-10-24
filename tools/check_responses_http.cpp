@@ -21,13 +21,16 @@
 #include <cstdio>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <mutex>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <atomic>
 #include <chrono>
+#include <set>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -117,11 +120,20 @@ public:
         : vocab_(vocab), script_(std::move(script)), im_end_(im_end) {}
 
     int64_t capacity() const override { return 8192; }
-    int64_t max_chunk() const override { return 512; }
+    int64_t max_chunk() const override { return max_chunk_.load(); }
     int64_t logits_row() const override { return vocab_; }
     int64_t pos() const override { return pos_; }
     void reset() override { pos_ = 0; at_ = 0; }
     std::vector<float> forward(const std::vector<int32_t> &ids, bool want_logits) override {
+        // The failure/cancellation knobs (STORY-10): a per-forward delay (keepalive cadence, mid-stream
+        // disconnect), and a simulated engine failure - plain (one request fails, the server keeps running)
+        // or GPU-fatal (the context is lost: this request 500s, every later submit is refused with 503).
+        const int64_t n = ++forwards_;
+        const int64_t ta = throw_after_.load(), tf = throw_fatal_.load();
+        if (ta >= 0 && n > ta) throw std::runtime_error("scripted backend: simulated engine failure");
+        if (tf >= 0 && n > tf) throw GpuFatalError("scripted backend: simulated GPU context loss");
+        const int64_t d = delay_us_.load();
+        if (d > 0) std::this_thread::sleep_for(std::chrono::microseconds(d));
         pos_ += (int64_t)ids.size();
         if (!want_logits) return {};
         // The script answers every request of the session: replay it when spent (a resumed request re-opens
@@ -153,6 +165,12 @@ public:
         script_ = std::move(script);
         at_ = 0;
     }
+    // Failure/cancel choreography (STORY-10): counters are forwards since the last set_* (each scenario
+    // re-arms right before its request, so the numbers are deterministic on the serialized engine).
+    void set_delay_us(int64_t us) { forwards_ = 0; delay_us_.store(us); }
+    void set_max_chunk(int64_t n) { max_chunk_.store(n); }
+    void set_throw_after(int64_t n) { forwards_ = 0; throw_after_.store(n); }   // -1: off
+    void set_throw_fatal(int64_t n) { forwards_ = 0; throw_fatal_.store(n); }   // -1: off
 
 private:
     int32_t vocab_, im_end_;
@@ -160,6 +178,7 @@ private:
     int64_t at_ = 0, pos_ = 0;
     std::mutex mu_;
     int64_t snap_[4] = {-1, -1, -1, -1};
+    std::atomic<int64_t> delay_us_{0}, max_chunk_{512}, throw_after_{-1}, throw_fatal_{-1}, forwards_{0};
 };
 
 // --- the checks -----------------------------------------------------------------------------------------
@@ -175,7 +194,138 @@ json::Value err_field(const httplib::Response &res, const char *key) {
     return json::Value();
 }
 
-void check_routes(httplib::Client &cli, const std::string &model_id, const Tokenizer &tok, ScriptedLmBackend &be) {
+// The n of strix_requests_total{outcome="..."} on the wire (GET /metrics); -1 when the page is missing.
+long metric_outcome(httplib::Client &cli, const char *outcome) {
+    auto res = cli.Get("/metrics");
+    if (!res || res->status != 200) return -1;
+    const std::string key = "strix_requests_total{outcome=\"" + std::string(outcome) + "\"} ";
+    const size_t p = res->body.find(key);
+    if (p == std::string::npos) return 0;
+    return std::strtol(res->body.c_str() + p + key.size(), nullptr, 10);
+}
+
+long vmrss_kb() {
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line))
+        if (line.rfind("VmRSS:", 0) == 0) return std::strtol(line.c_str() + 6, nullptr, 10);
+    return -1;
+}
+
+// Concurrency on the live route (STORY-10): requests run through the engine queue one after the other, and
+// every one of them is served against ITS OWN parse - above all the tool registry, which lives inside the
+// parsed request. The same model call is valid for the request that offered the tool and a typed refusal for
+// the one that did not, side by side, in flight together.
+void check_concurrency(int port, const std::string &model_id, const Tokenizer &tok, ScriptedLmBackend &be) {
+    std::vector<int32_t> text_script;
+    for (char c : std::string_view("thinking\n")) text_script.push_back(tok.byte_token((uint8_t)c));
+    text_script.push_back(tok.id_of(tagc("think").c_str()));
+    for (char c : std::string_view(" Hello world")) text_script.push_back(tok.byte_token((uint8_t)c));
+    const int32_t im_end = tok.id_of(sp("im_end").c_str());
+    text_script.push_back(im_end);
+    std::vector<int32_t> tool_script;
+    tool_script.push_back(tok.id_of(tag("tool_call").c_str()));
+    for (char c : std::string_view("\n<function=f>\n<parameter=x>\n1\n</parameter>\n</function>\n"))
+        tool_script.push_back(tok.byte_token((uint8_t)c));
+    tool_script.push_back(tok.id_of(tagc("tool_call").c_str()));
+    tool_script.push_back(im_end);
+
+    be.set_script(text_script);
+    const std::string body = "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"max_output_tokens\":64}";
+    {  // Six non-streaming turns at once: all served, all completed, six distinct ids.
+        constexpr int n = 6;
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        std::vector<std::thread> ths;
+        std::vector<int> codes(n, -1);
+        std::vector<std::string> ids(n);
+        for (int i = 0; i < n; ++i)
+            ths.emplace_back([&, i] {
+                httplib::Client c("127.0.0.1", port);
+                c.set_read_timeout(15, 0);
+                if (++ready == n) go = true;
+                while (!go.load()) std::this_thread::yield();
+                auto r = c.Post("/v1/responses", body, "application/json");
+                if (!r) return;
+                codes[i] = r->status;
+                if (r->status == 200) {
+                    json::Value b = json::Value::parse(r->body);
+                    codes[i] = b.find("status")->as_string("st") == "completed" ? 1200 : -2;
+                    ids[i] = b.find("id")->as_string("id");
+                }
+            });
+        for (auto &th : ths) th.join();
+        int good = 0;
+        for (int i = 0; i < n; ++i) good += codes[i] == 1200;
+        ok(good == n, "six concurrent turns all complete, got ", good);
+        const std::set<std::string> uniq(ids.begin(), ids.end());
+        ok(uniq.size() == (size_t)n, "concurrent responses carry unique ids, got ", uniq.size());
+    }
+    {  // Two streaming turns at once: each stream gets its own created...completed pair.
+        std::atomic<int> ready{0};
+        std::atomic<bool> go{false};
+        std::vector<std::thread> ths;
+        std::vector<int> done(2, 0);
+        std::vector<std::string> accs(2);
+        const std::string sbody = "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"stream\":true,\"max_output_tokens\":64}";
+        for (int i = 0; i < 2; ++i)
+            ths.emplace_back([&, i] {
+                httplib::Client c("127.0.0.1", port);
+                c.set_read_timeout(20, 0);
+                if (++ready == 2) go = true;
+                while (!go.load()) std::this_thread::yield();
+                std::string acc;
+                auto r = c.Post("/v1/responses", httplib::Headers{}, sbody, "application/json",
+                                [&](const char *d, size_t l) { acc.append(d, l); return true; });
+                (void)r;  // the stream is fully consumed by the receiver
+                accs[i] = acc;
+                done[i] = acc.find("\"type\":\"response.created\"") != std::string::npos &&
+                          acc.find("\"type\":\"response.completed\"") != std::string::npos;
+            });
+        for (auto &th : ths) th.join();
+        ok(done[0] && done[1], "two concurrent streams each complete their own lifecycle");
+        if (!(done[0] && done[1]))
+            for (int i = 0; i < 2; ++i)
+                std::printf("DBG stream[%d] size %zu: %s\n", i, accs[i].size(), accs[i].substr(0, 240).c_str());
+    }
+    {  // The model calls tool f: the streaming request that offered f completes with the call; the request
+       // that offered only g, queued behind it, gets the typed refusal. No registry is shared.
+        be.set_script(tool_script);
+        std::string bres;
+        int bcode = -1;
+        std::thread b([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));  // in flight while A streams
+            httplib::Client c("127.0.0.1", port);
+            c.set_read_timeout(20, 0);
+            auto r = c.Post("/v1/responses",
+                            "{\"model\":\"" + model_id + "\",\"input\":\"run g\",\"max_output_tokens\":64,"
+                            "\"tools\":[{\"type\":\"function\",\"name\":\"g\",\"parameters\":{\"type\":\"object\"}}]}",
+                            "application/json");
+            bcode = r ? r->status : -1;
+            bres = r ? r->body : "";
+        });
+        httplib::Client a("127.0.0.1", port);
+        a.set_read_timeout(20, 0);
+        std::string acc;
+        {
+            auto r = a.Post("/v1/responses", httplib::Headers{},
+                            "{\"model\":\"" + model_id + "\",\"input\":\"run f\",\"stream\":true,\"max_output_tokens\":64,"
+                            "\"tools\":[{\"type\":\"function\",\"name\":\"f\",\"parameters\":{\"type\":\"object\"}}]}",
+                            "application/json", [&](const char *d, size_t l) { acc.append(d, l); return true; });
+            (void)r;  // fully consumed by the receiver
+        }
+        b.join();
+        ok(acc.find("\"type\":\"response.completed\"") != std::string::npos &&
+                   acc.find("\"name\":\"f\"") != std::string::npos,
+           "the request that offered f completes with its call on the stream");
+        ok(bcode == 500 && bres.find("did not offer") != std::string::npos,
+           "the request that did not offer f gets the typed refusal (per-request registry), got ", bcode);
+    }
+    be.set_script(text_script);
+}
+
+void check_routes(httplib::Client &cli, const std::string &model_id, const Tokenizer &tok, ScriptedLmBackend &be,
+                  int port) {
     // The text answer (default) and the tool-call answer, replayed per request; scripts swap between cases.
     std::vector<int32_t> text_script;
     for (char c : std::string_view("thinking\n")) text_script.push_back(tok.byte_token((uint8_t)c));
@@ -261,7 +411,6 @@ void check_routes(httplib::Client &cli, const std::string &model_id, const Token
            "usage from the engine: input/cached/output/reasoning tokens real");
     }
     {  // A tool call the request offered: a completed function_call item, ids separate, registry-checked.
-        std::fprintf(stderr, "DBG main: before tool POST\n");
         be.set_script(tool_script);
         auto res = cli.Post("/v1/responses",
                             "{\"model\":\"" + model_id + "\",\"input\":\"run f\",\"max_output_tokens\":64,"
@@ -289,7 +438,6 @@ void check_routes(httplib::Client &cli, const std::string &model_id, const Token
         auto res = cli.Post("/v1/responses", httplib::Headers{},
                             "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"stream\":true}", "application/json",
                             [&](const char *data, size_t len) { acc.append(data, len); return true; });
-        std::fprintf(stderr, "DBG case: responses streaming Post returned\n");
         ok(res && res->status == 200, "streaming POST completed, status ", res ? std::to_string(res->status) : "none");
         ok(acc.find("response.created") != std::string::npos && acc.find("response.in_progress") != std::string::npos,
            "created + in_progress");
@@ -307,7 +455,6 @@ void check_routes(httplib::Client &cli, const std::string &model_id, const Token
         }
         ok(out.good(), "stream dumped");
         out.close();
-        std::fprintf(stderr, "DBG main: streaming case done\n");
         if (getenv("STREAM_ONLY")) { ok(true, "stream-only probe"); return; }
     }
     {  // Reasoning interop on the live route (STORY-09, host half): effort none -> no reasoning, no reasoning tokens.
@@ -408,6 +555,7 @@ void check_routes(httplib::Client &cli, const std::string &model_id, const Token
         ok(acc.find("\"content\":\"d\"") != std::string::npos, "Chat SSE streamed content deltas");
         ok(acc.find("\"finish_reason\":\"stop\"") != std::string::npos, "Chat SSE carries the stop finish");
     }
+    check_concurrency(port, model_id, tok, be);
     {  // /health and /v1/models keep answering (the shared server surface).
         auto res = cli.Get("/health");
         ok(res && res->status == 200, "GET /health -> 200");
@@ -424,6 +572,227 @@ std::string write_temp_tokenizer(const std::string &dir) {
     STRIX_CHECK(f.good(), "write of '", path, "' failed");
     f.close();
     return path;
+}
+
+// The failure, cancellation and limit matrix on the live route (STORY-10 / gate B10), on its own server:
+// small body limit, fast keepalive. The negative matrix (status + error.param, every answer typed, never 404,
+// never a Chat-shaped body), rejections proven to fail BEFORE submit (the engine's counters never move), no
+// memory growth under repeated failures, keepalive comments during a slow prefill, a mid-stream client abort
+// cancelling the generation (QueueSink::cancel -> the engine's cancelled outcome on the metrics), an engine
+// exception before and after streaming, and after a GPU-fatal failure every later submit refused with 503 -
+// while a malformed body is still answered 400 (fail fast before submit). Scripted backend, no GPU.
+void check_failure_phase(const std::string &tok_path, const std::string &model_id) {
+    Tokenizer tok(tok_path);
+    std::vector<int32_t> text_script;
+    for (char c : std::string_view("thinking\n")) text_script.push_back(tok.byte_token((uint8_t)c));
+    text_script.push_back(tok.id_of(tagc("think").c_str()));
+    for (char c : std::string_view(" Hello world")) text_script.push_back(tok.byte_token((uint8_t)c));
+    const int32_t im_end = tok.id_of(sp("im_end").c_str());
+    text_script.push_back(im_end);
+    ScriptedLmBackend be(tok.size(), text_script, im_end);
+    Engine::Options options;
+    options.think_nudge = false;
+    Engine engine(be, tok, options);
+
+    ServerConfig cfg;
+    cfg.port = 0;
+    cfg.model_id = model_id;
+    cfg.keepalive_s = 0.05;    // comments arrive fast enough to observe the cadence
+    cfg.max_body_bytes = 8192;  // an oversize request is cheap to make
+    HttpServer server(engine, tok, cfg);
+    const int port = server.bind();
+    STRIX_CHECK(port > 0, "phase-2 bind failed");
+    std::thread thr([&] { server.serve(); });
+    // The whole matrix runs inside a try: an escaping assertion exception must never destroy thr joinable
+    // (that is how a test bug turns into a terminate with no report).
+    try {
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_read_timeout(20, 0);
+    const std::string ok_body = "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"max_output_tokens\":64}";
+
+    {  // Body limit: over max_body_bytes -> 413, refused before the handler runs.
+        auto res = cli.Post("/v1/responses", std::string(40000, 'x'), "application/json");
+        ok(res && res->status == 413, "oversize body -> 413, got ", res ? std::to_string(res->status) : "none");
+    }
+    {  // A response resource asked for by id: the stateless answer, typed (not httplib's empty-body 404).
+        auto res = cli.Get("/v1/responses/resp_does_not_exist");
+        ok(res && res->status == 404, "GET a response by id -> 404, got ", res ? std::to_string(res->status) : "none");
+        ok(res && err_field(*res, "type").as_string("type") == "not_found", "the 404 is typed 'not_found'");
+        ok(res && res->body.find("stateless") != std::string::npos, "the 404 explains itself");
+    }
+    {  // The negative matrix on the wire: status + the field named, typed, Chat-free. (The parser's full
+       // breadth is check_responses/_norm/_tools; this is the HTTP face of the same contract.)
+        struct Neg {
+            const char *body;
+            int status;
+            const char *param;  // nullptr: any non-empty param/message
+        };
+        const Neg cases[] = {
+            {"{not json", 400, nullptr},
+            {"[1,2]", 400, nullptr},  // the body itself is not an object: no field to name (param null)
+            {"{\"input\":\"hi\"}", 400, "model"},
+            {"{\"model\":\"other-model\",\"input\":\"hi\"}", 400, "model"},
+            {"{\"model\":\"qwen3.8-flash-next\",\"input\":\"hi\",\"previous_response_id\":\"resp_1\"}", 400,
+             "previous_response_id"},
+            {"{\"model\":\"qwen3.8-flash-next\",\"input\":\"hi\",\"store\":true}", 400, "store"},
+            {"{\"model\":\"qwen3.8-flash-next\",\"input\":\"hi\",\"tools\":[{\"type\":\"file_search\"}]}",
+             400, "tools"},
+            {"{\"model\":\"qwen3.8-flash-next\",\"input\":\"hi\",\"tools\":[{\"type\":\"function\"}]}",
+             400, "tools"},
+            {"{\"model\":\"qwen3.8-flash-next\",\"input\":[{\"type\":\"mystery\"}]}", 400, "input"},
+            {"{\"model\":\"qwen3.8-flash-next\",\"input\":\"hi\",\"tool_choice\":\"required\"}", 400,
+             "tool_choice"},
+            {"{\"model\":\"qwen3.8-flash-next\",\"input\":\"hi\",\"max_output_tokens\":0}", 400,
+             "max_output_tokens"},
+            {"{\"model\":\"qwen3.8-flash-next\",\"input\":\"hi\",\"truncation\":\"auto\"}", 400,
+             "truncation"},
+        };
+        for (const Neg &c : cases) {
+            auto res = cli.Post("/v1/responses", c.body, "application/json");
+            ok(res && res->status == c.status, "negative case status ", c.status, " for ",
+               std::string(c.body).substr(0, 46), ", got ", res ? std::to_string(res->status) : "none");
+            if (!res) continue;
+            ok(err_field(*res, "type").as_string("type") == "invalid_request_error", "typed client error for ",
+               std::string(c.body).substr(0, 40));
+            ok(!err_field(*res, "message").as_string("m").empty(), "an actionable message for ",
+               std::string(c.body).substr(0, 40));
+            if (c.param)
+                ok(!err_field(*res, "param").is_null() && err_field(*res, "param").as_string("p") == c.param,
+                   "param '", c.param, "' named for ", std::string(c.body).substr(0, 40));
+        }
+    }
+    {  // Fail fast BEFORE submit + no leak: 150 rejections and 30 oversize bodies move no engine counter,
+       // and the process's RSS stays within a bounded band.
+        const long t0 = metric_outcome(cli, "ok") + metric_outcome(cli, "error") + metric_outcome(cli, "cancelled");
+        const long rss0 = vmrss_kb();
+        int good400 = 0, good413 = 0;
+        for (int i = 0; i < 150; ++i) {
+            auto res = cli.Post("/v1/responses", "{\"model\":\"" + model_id + "\",\"input\":42}", "application/json");
+            good400 += res && res->status == 400;
+        }
+        for (int i = 0; i < 30; ++i) {
+            auto res = cli.Post("/v1/responses", std::string(20000, 'x'), "application/json");
+            good413 += res && res->status == 413;
+        }
+        const long t1 = metric_outcome(cli, "ok") + metric_outcome(cli, "error") + metric_outcome(cli, "cancelled");
+        const long rss1 = vmrss_kb();
+        ok(good400 == 150, "150 rejections all answered 400, got ", good400);
+        ok(good413 == 30, "30 oversize bodies all answered 413, got ", good413);
+        ok(t1 == t0, "rejections never reached the engine queue (", t0, " -> ", t1, ")");
+#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && __has_feature(address_sanitizer))
+        const long rss_limit = 196608;  // ASAN quarantines freed memory: it bounds the allocator, not the code
+        // (the real leak measure is the Debug run of this same binary, where the band is 32 MB).
+#else
+        const long rss_limit = 32768;
+#endif
+        ok(rss0 >= 0 && rss1 >= 0 && rss1 - rss0 < rss_limit, "no memory growth under repeated failures (", rss0,
+           " -> ", rss1, " kB)");
+    }
+    {  // Keepalive during a slow prefill: SSE comments (started, prefill progress) arrive while nothing streams.
+        be.set_max_chunk(24);
+        be.set_delay_us(70000);  // 246 tokens = 11 chunk-forwards, 70 ms each
+        std::string acc;
+        auto res = cli.Post("/v1/responses", httplib::Headers{}, "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"stream\":true}",
+                            "application/json", [&](const char *d, size_t l) { acc.append(d, l); return true; });
+        be.set_delay_us(0);
+        be.set_max_chunk(512);
+        ok(res && res->status == 200, "slow streaming request -> 200");
+        int comments = 0;  // a comment frame is "\n\n: ..." (data frames start with "data: ")
+        for (size_t p = acc.find("\n\n: "); p != std::string::npos; p = acc.find("\n\n: ", p + 4)) ++comments;
+        ok(acc.find(": prefill") != std::string::npos, "the waiting phase emits progress comments (keepalive)");
+        ok(acc.find("\n\n: ") < acc.find("\"type\":\"response.output_text.delta\""),
+           "comments arrive while the turn produces no deltas (the stream stays alive)");
+        ok(comments >= 3, "the keepalive cadence kept the stream alive (", comments, " comments)");
+        ok(acc.find("\"type\":\"response.completed\"") != std::string::npos, "the turn completes after the comments");
+    }
+    {  // Client abort mid-stream -> QueueSink::cancel: the engine stops the generation (cancelled outcome on
+       // the metrics) and the server is healthy right after (the session, no leak).
+        std::vector<int32_t> long_script;
+        long_script.push_back(tok.id_of(tagc("think").c_str()));
+        for (int k = 0; k < 200; ++k) long_script.push_back(tok.byte_token('x'));
+        long_script.push_back(im_end);
+        be.set_script(long_script);
+        be.set_delay_us(15000);
+        const long c0 = metric_outcome(cli, "cancelled");
+        {
+            httplib::Client aborter("127.0.0.1", port);
+            aborter.set_read_timeout(20, 0);
+            size_t seen = 0;
+            auto res = aborter.Post("/v1/responses", httplib::Headers{},
+                                    "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"stream\":true}",
+                                    "application/json",
+                                    [&](const char *d, size_t l) {
+                                        seen += l;
+                                        return seen < 400;  // hang up mid-stream
+                                    });
+            (void)res;  // the client-side error of hanging up is the point
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(600));
+        const long c1 = metric_outcome(cli, "cancelled");
+        ok(c1 >= c0 + 1, "the aborted stream was cancelled by the engine (", c0, " -> ", c1, ")");
+        be.set_delay_us(0);
+        be.set_script(text_script);
+        auto res = cli.Post("/v1/responses", ok_body, "application/json");
+        ok(res && res->status == 200, "the server is healthy right after the abort, got ",
+           res ? std::to_string(res->status) : "none");
+        ok(res && res->body.find("\"status\":\"completed\"") != std::string::npos, "the next turn completes");
+    }
+    {  // Engine exception AFTER streaming began: the stream gets its single typed terminal, response.failed
+       // (never a fake completed, no double terminal), and the request's deltas are not re-published.
+        be.set_throw_after(3);  // prefill (1 forward) + 2 answer tokens, then the forward throws
+        std::string acc;
+        auto res = cli.Post("/v1/responses", httplib::Headers{}, "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"stream\":true}",
+                            "application/json", [&](const char *d, size_t l) { acc.append(d, l); return true; });
+        ok(res && res->status == 200, "the failure rides a 200 stream (headers were already sent)");
+        ok(acc.find("\"type\":\"response.failed\"") != std::string::npos, "a typed response.failed terminal");
+        ok(acc.find("simulated engine failure") != std::string::npos, "the failure carries the real message");
+        ok(acc.find("\"type\":\"response.completed\"") == std::string::npos, "no fake completed after a failure");
+        size_t terminals = 0;
+        for (const char *term : {"\"type\":\"response.completed\"", "\"type\":\"response.incomplete\"",
+                                 "\"type\":\"response.failed\""})
+            for (size_t p = acc.find(term); p != std::string::npos; p = acc.find(term, p + 1)) ++terminals;
+        ok(terminals == 1, "exactly one terminal event on the failed stream, got ", terminals);
+        be.set_throw_after(-1);
+        {  // The same failure BEFORE any stream (non-streaming): a plain 500 JSON, typed.
+            be.set_throw_after(2);
+            auto r = cli.Post("/v1/responses", ok_body, "application/json");
+            ok(r && r->status == 500, "an engine failure on a non-streaming request -> 500, got ",
+               r ? std::to_string(r->status) : "none");
+            ok(r && err_field(*r, "type").as_string("t") == "server_error", "the 500 is a typed server_error");
+            ok(r && r->body.find("simulated engine failure") != std::string::npos, "the 500 carries the message");
+            be.set_throw_after(-1);
+        }
+        auto res2 = cli.Post("/v1/responses", ok_body, "application/json");
+        ok(res2 && res2->status == 200, "the server recovers after the failed requests");
+    }
+    {  // A GPU-fatal failure: the request itself 500s, every later submit is refused 503 (typed, with the
+       // reason), /health goes 503 - and a MALFORMED body is still answered 400: validation runs before
+       // submit, so the refusal storm cannot degrade client errors.
+        be.set_throw_fatal(2);
+        auto r = cli.Post("/v1/responses", ok_body, "application/json");
+        ok(r && r->status == 500, "the fatal request itself -> 500, got ", r ? std::to_string(r->status) : "none");
+        ok(r && r->body.find("simulated GPU context loss") != std::string::npos, "the 500 names the loss");
+        r = cli.Post("/v1/responses", ok_body, "application/json");
+        ok(r && r->status == 503, "the next non-streaming submit is refused -> 503, got ",
+           r ? std::to_string(r->status) : "none");
+        ok(r && r->body.find("GPU failed on an earlier request") != std::string::npos, "the 503 explains itself");
+        r = cli.Post("/v1/responses", "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"stream\":true}",
+                     "application/json");
+        ok(r && r->status == 503, "streaming submits are refused too (no half-open SSE), got ",
+           r ? std::to_string(r->status) : "none");
+        r = cli.Post("/v1/responses", "{not json", "application/json");
+        ok(r && r->status == 400, "validation still fails fast (400) while the engine refuses, got ",
+           r ? std::to_string(r->status) : "none");
+        r = cli.Get("/health");
+        ok(r && r->status == 503, "/health reports the lost GPU (503), got ", r ? std::to_string(r->status) : "none");
+    }
+    } catch (const std::exception &e) {
+        ++checks;
+        ++failures;
+        std::printf("FAIL (phase-2 unhandled): %s\n", e.what());
+    }
+    server.stop();
+    thr.join();
 }
 
 }  // namespace
@@ -470,10 +839,11 @@ int main(int argc, char **argv) {
         }
         httplib::Client cli("127.0.0.1", port);
         cli.set_read_timeout(10, 0);
-        check_routes(cli, cfg.model_id, tok, be);
+        check_routes(cli, cfg.model_id, tok, be, port);
 
         server.stop();
         thr.join();
+        check_failure_phase(tok_path, cfg.model_id);
     } catch (const std::exception &e) {
         std::printf("FAIL (unhandled): %s\n", e.what());
         return 2;

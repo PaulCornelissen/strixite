@@ -324,9 +324,9 @@ void HttpServer::routes() {
         gen.id = id, gen.stream = cr.stream;
         if (!cr.seeded) cr.sampling.seed = std::random_device{}();
         gen.sampling = cr.sampling;
-        auto tools = std::make_shared<json::Value>(cr.tools);  // outlives the request inside the engine
+        gen.tools_owner = std::make_shared<json::Value>(cr.tools);  // the request outlives the handler (the engine parses)
         gen.parser.thinking = !(cr.template_options.enable_thinking.has_value() && !*cr.template_options.enable_thinking);
-        gen.parser.tools = tools->is_null() ? nullptr : tools.get();
+        gen.parser.tools = gen.tools_owner->is_null() ? nullptr : gen.tools_owner.get();
         gen.parser.stop = cr.stop;
         gen.parser.id_seed = std::random_device{}();
         gen.parser.stream_calls = cr.stream;
@@ -372,7 +372,7 @@ void HttpServer::routes() {
         }
 
         res.set_header("Cache-Control", "no-cache");
-        res.set_chunked_content_provider("text/event-stream", [sink, meta, clamped, keepalive, tools, rp = cr.return_progress](size_t, httplib::DataSink &out) {
+        res.set_chunked_content_provider("text/event-stream", [sink, meta, clamped, keepalive, rp = cr.return_progress](size_t, httplib::DataSink &out) {
             const auto send = [&](const std::string &data) {
                 const std::string frame = "data: " + data + "\n\n";
                 if (!out.write(frame.data(), frame.size())) {
@@ -513,10 +513,10 @@ void HttpServer::routes() {
         gen.stream = rr.chat.stream;
         if (!rr.chat.seeded) rr.chat.sampling.seed = std::random_device{}();
         gen.sampling = rr.chat.sampling;
-        auto tools = std::make_shared<json::Value>(rr.chat.tools);  // outlives the request inside the engine
+        gen.tools_owner = std::make_shared<json::Value>(rr.chat.tools);  // the request outlives the handler (the engine parses)
         gen.parser.thinking =
             !(rr.chat.template_options.enable_thinking.has_value() && !*rr.chat.template_options.enable_thinking);
-        gen.parser.tools = tools->is_null() ? nullptr : tools.get();
+        gen.parser.tools = gen.tools_owner->is_null() ? nullptr : gen.tools_owner.get();
         gen.parser.stop = rr.chat.stop;
         gen.parser.id_seed = std::random_device{}();
         gen.parser.stream_calls = false;  // buffered: only completed, valid calls are published
@@ -626,6 +626,15 @@ void HttpServer::routes() {
             return send_error(res, e.status, e.what(), e.type, e.param);
         }
         res.set_content(out.dump(), "application/json");
+    });
+
+    // GET on a response resource: this server is stateless (no store, no previous_response_id) - there is no
+    // response to fetch, so the answer is a typed 404 with the reason, not httplib's empty-body default.
+    svr_->Get(R"(/v1/responses/.+)", [this](const httplib::Request &req, httplib::Response &res) {
+        const int64_t id = ++next_id_;
+        log_error(id, req, 404, "this server does not store responses: there is no response to fetch by id");
+        send_error(res, 404, "this server is stateless: responses are not stored, so none can be fetched by id "
+                             "(send the whole conversation in 'input' on every POST)", "not_found", "id");
     });
 
     // Legacy completions: the raw prompt as is - no chat template, no
@@ -966,14 +975,15 @@ void HttpServer::routes() {
         res.set_content(m, "text/plain; version=0.0.4");
     });
 
-    // One handler for every error status. 404 gets its JSON body; a 400 whose body never fully arrived gets turned
+    // One handler for every error status. A 404 gets its JSON body only when no route filled one; a 400 whose body never fully arrived gets turned
     // into the retryable 408 the client can act on (strixite #15: httplib answers the abandoned read itself,
     // before any route ran - an empty, unlogged 400, which OpenCode took for its own fault and stopped the
     // session; the OpenAI SDKs retry 408 and x-should-retry, not 400). Errors raised inside a route carry their own JSON and pass
     // through untouched, as do parse failures (which never get a POST's framing).
     svr_->set_error_handler([this](const httplib::Request &req, httplib::Response &res) {
         if (res.status == 404) {
-            send_error(res, 404, "no route " + req.method + " " + req.path, "not_found_error");
+            if (res.body.empty())  // a route that answered its own 404 (GET on a response resource: the
+                send_error(res, 404, "no route " + req.method + " " + req.path, "not_found_error");  // stateless reason) keeps its body
             return;
         }
         if (res.status != 400 || !res.body.empty() || req.method != "POST" || req.target.empty()) return;
