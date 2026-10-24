@@ -286,6 +286,10 @@ target_link_libraries(check_responses_body PRIVATE strix_serve)
 add_executable(check_responses_stream tools/check_responses_stream.cpp)
 target_link_libraries(check_responses_stream PRIVATE strix_serve)
 
+# The Responses reasoning interop: effort table, Chat-parity budget semantics, emitter invariants.
+add_executable(check_responses_reasoning tools/check_responses_reasoning.cpp)
+target_link_libraries(check_responses_reasoning PRIVATE strix_serve)
+
 # The /v1/responses HTTP surface on a scripted backend (a synthetic tokenizer stands in for the model's), host
 # only: the route contract (400/501, never 404) and the untouched Chat route end to end without a GPU.
 add_executable(check_responses_http tools/check_responses_http.cpp)

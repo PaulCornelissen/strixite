@@ -139,3 +139,33 @@ again; openai-python's parsing stream helpers (strict tools) raise; a client tha
 can run the repaired call - complete when the call broke between parameters, wrong when it was cut off inside a
 value. Sent back in the conversation, a call whose arguments were left open this way is shown to the model with no
 parameters, rather than failing the request.
+
+## Responses (`POST /v1/responses`): reasoning
+
+The Responses endpoint (the wire Codex drives) streams the model's **raw** thinking, not a summary: the reasoning
+item carries a `reasoning_text` content part with exactly what the model wrote, `summary` is always the empty
+array and `encrypted_content` is always `null` - this server has no summarizer and no key, and invents neither.
+
+`reasoning.effort` maps onto the thinking switch above (the same template settings and the same budget/cap
+semantics the Chat route runs - the same functions):
+
+| `reasoning.effort` | what the server does |
+|---|---|
+| absent | the server's `thinking` default (config), thinking on unless it says off |
+| `"none"` | thinking off: no think block, no reasoning item, `reasoning_tokens` 0 |
+| `"minimal"`, `"low"` | thinking on, template effort `low` |
+| `"medium"` | thinking on, template effort `medium` |
+| `"high"`, `"xhigh"` | thinking on, template effort `xhigh` (the model's default depth) |
+
+An explicit effort (anything but `none`) marks thinking as requested: with `max_output_tokens` set, the budget is
+`max_output_tokens - max(64, 15%)` - the Chat rule, so the answer always keeps its room. A `reasoning.summary`
+value is accepted (it is part of what Codex sends) and changes nothing: the raw text is what streams.
+
+Two honest limits:
+
+- **No plaintext replay.** Thinking from an earlier turn is not re-rendered as reasoning on a later request (the
+  template regenerates the block only for the kept assistant turns; `reasoning` input items are validated and
+  skipped as display metadata). The conversation context - calls, results, text - is preserved exactly.
+- **No encrypted reasoning.** `include: ["reasoning.encrypted_content"]` is accepted; the field is always `null`.
+
+To see the thinking in Codex, set `show_raw_agent_reasoning = true` in `~/.codex/config.toml`.

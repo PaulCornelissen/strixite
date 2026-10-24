@@ -310,9 +310,74 @@ void check_routes(httplib::Client &cli, const std::string &model_id, const Token
         std::fprintf(stderr, "DBG main: streaming case done\n");
         if (getenv("STREAM_ONLY")) { ok(true, "stream-only probe"); return; }
     }
+    {  // Reasoning interop on the live route (STORY-09, host half): effort none -> no reasoning, no reasoning tokens.
+        std::vector<int32_t> no_think;
+        for (char c : std::string_view(" the answer")) no_think.push_back(tok.byte_token((uint8_t)c));
+        no_think.push_back(im_end);
+        be.set_script(no_think);
+        auto res = cli.Post("/v1/responses",
+                            "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"max_output_tokens\":256,"
+                            "\"reasoning\":{\"effort\":\"none\"}}",
+                            "application/json");
+        ok(res && res->status == 200, "effort-none POST -> 200, got ", res ? std::to_string(res->status) : "none");
+        if (res && res->status == 200) {
+            json::Value b = json::Value::parse(res->body);
+            bool has_reasoning = false, has_answer = false;
+            for (const auto &it : b.find("output")->as_array("o"))
+                if (it.find("type")->as_string("t") == "reasoning") has_reasoning = true;
+            for (const auto &it : b.find("output")->as_array("o"))
+                if (it.find("type")->as_string("t") == "message") has_answer = true;
+            ok(!has_reasoning && has_answer, "effort none: no reasoning item, the answer is there");
+            ok(b.find("usage")->find("output_tokens_details")->find("reasoning_tokens")->as_int("rt") == 0,
+               "effort none: reasoning_tokens 0");
+        }
+    }
+    {  // Long thinking meets the budget (the Chat engine's rule): the turn closes, completes, tokens are real.
+        std::vector<int32_t> long_think;
+        for (int k = 0; k < 40; ++k) long_think.push_back(tok.byte_token('t'));
+        long_think.push_back(im_end);
+        be.set_script(long_think);
+        auto res = cli.Post("/v1/responses",
+                            "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"max_output_tokens\":100,"
+                            "\"reasoning\":{\"effort\":\"low\"}}",
+                            "application/json");
+        ok(res && res->status == 200, "long-thinking POST -> 200 (budget closes the think block), got ",
+           res ? std::to_string(res->status) : "none");
+        if (res && res->status == 200) {
+            json::Value b = json::Value::parse(res->body);
+            const std::string st = b.find("status")->as_string("st");
+            ok(st == "completed" || st == "incomplete",
+               "the capped-think turn ends truthfully (completed, or incomplete under the cap), got ", st);
+            const json::Value &u = *b.find("usage");
+            ok(u.find("output_tokens_details")->find("reasoning_tokens")->as_int("rt") >= 30,
+               "reasoning ran to the budget (>= 30 tokens), got ",
+               u.find("output_tokens_details")->find("reasoning_tokens")->as_int("rt"));
+            ok(u.find("output_tokens")->as_int("o") <= 100, "completion tokens stayed under max_output_tokens");
+        }
+    }
+    {  // A turn that is all reasoning: one completed raw item, the invariants on the live body.
+        std::vector<int32_t> think_only;
+        for (char c : std::string_view("pure thought\n")) think_only.push_back(tok.byte_token((uint8_t)c));
+        think_only.push_back(tok.id_of(tagc("think").c_str()));
+        think_only.push_back(im_end);
+        be.set_script(think_only);
+        auto res = cli.Post("/v1/responses", "{\"model\":\"" + model_id + "\",\"input\":\"hi\"}", "application/json");
+        ok(res && res->status == 200, "reasoning-only POST -> 200");
+        if (res && res->status == 200) {
+            json::Value b = json::Value::parse(res->body);
+            const json::Value &out = *b.find("output");
+            ok(out.as_array("o").size() == 1 && out.as_array("o")[0].find("type")->as_string("t") == "reasoning",
+               "one raw reasoning item, no message item");
+            ok(out.as_array("o")[0].find("summary")->as_array("s").empty() &&
+                       out.as_array("o")[0].find("encrypted_content")->is_null() &&
+                       out.as_array("o")[0].find("content")->as_array("c")[0].find("type")->as_string("t") ==
+                           "reasoning_text",
+               "live body invariants: summary [], encrypted_content null, reasoning_text raw");
+        }
+    }
     {  // Chat untouched: any model name is served (the model refusal above is Responses-only), the scripted
        // answer comes back as Chat content with real usage.
-        be.set_script(text_script);
+        be.set_script(text_script);  // re-arm after the reasoning scripts
         auto res = cli.Post("/v1/chat/completions",
                             "{\"model\":\"anything\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
                             "\"temperature\":0,\"max_tokens\":2048}",
