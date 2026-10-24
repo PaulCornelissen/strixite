@@ -215,6 +215,7 @@ add_library(strix_serve STATIC
     serve/think_nudge.cpp
     serve/server_config.cpp
     serve/openai.cpp
+    serve/responses.cpp
     serve/http_server.cpp
     serve/memory_plan.cpp
     serve/prompt_cache.cpp
@@ -253,6 +254,17 @@ target_link_libraries(strix_serve_model PUBLIC strix_serve strix_model)
 # check_stream_calls <tokenizer.json> [random cases] [seed].
 add_executable(check_stream_calls tools/check_stream_calls.cpp)
 target_link_libraries(check_stream_calls PRIVATE strix_serve)
+
+# The /v1/responses request contract against the sanitized Codex fixture, host only (no model, no tokenizer):
+# check_responses [tools/testdata/codex-request-sample.json]
+add_executable(check_responses tools/check_responses.cpp)
+target_link_libraries(check_responses PRIVATE strix_serve)
+
+# The /v1/responses HTTP surface on a scripted backend (a synthetic tokenizer stands in for the model's), host
+# only: the route contract (400/501, never 404) and the untouched Chat route end to end without a GPU.
+add_executable(check_responses_http tools/check_responses_http.cpp)
+target_link_libraries(check_responses_http PRIVATE strix_serve)
+target_include_directories(check_responses_http SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/third_party/cpp-httplib")
 
 add_executable(strix_server tools/strix_server.cpp)
 target_link_libraries(strix_server PRIVATE strix_serve_model)

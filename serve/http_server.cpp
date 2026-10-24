@@ -4,6 +4,7 @@
 #include "serve/chat_template.hpp"
 #include "serve/log.hpp"
 #include "serve/openai.hpp"
+#include "serve/responses.hpp"
 #include <httplib.h>  // third_party/cpp-httplib (vendored, SYSTEM include)
 
 #include <atomic>
@@ -447,6 +448,28 @@ void HttpServer::routes() {
                 }
             }
         });
+    });
+
+    // Responses API (the wire Codex drives): parse, validate, normalize into the Chat pipeline's form. Every
+    // rejected request is a typed 400 naming its field; a valid one is accepted generation not wired to this
+    // route yet, so it gets a typed 501 (B2: never a 404, never a Chat-shaped answer). The Chat route below is
+    // untouched: same handler, same defaults, same streaming - the new route shares the code, not the surface.
+    svr_->Post("/v1/responses", [this](const httplib::Request &req, httplib::Response &res) {
+        const int64_t id = ++next_id_;
+        try {
+            json::Value body;
+            try {
+                body = json::Value::parse(req.body);
+            } catch (const Error &e) {
+                throw ApiError(400, std::string("request body: ") + e.what());
+            }
+            parse_responses_request(body, cfg_.defaults, cfg_.model_id);
+            throw ApiError(501, "POST /v1/responses: the request is valid for this server; generation on this route lands in the next stories (docs/server.md)",
+                            {}, "not_implemented");
+        } catch (const ApiError &e) {
+            log_error(id, req, e.status, e.what());
+            send_error(res, e.status, e.what(), e.type, e.param);
+        }
     });
 
     // Legacy completions: the raw prompt as is - no chat template, no
