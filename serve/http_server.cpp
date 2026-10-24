@@ -82,12 +82,22 @@ void send_error(httplib::Response &res, int status, const std::string &msg, cons
     res.set_content(error_body(msg, type, param), "application/json");
 }
 
+// One log row per request fact: control bytes (the newline above all) become '.' - a client's model name,
+// tool name or message text reaches these lines verbatim, and an unescaped \n there forges log lines.
+std::string log_safe(const std::string &text) {
+    std::string out = text;
+    for (char &c : out) {
+        const unsigned char u = (unsigned char)c;
+        if (u < 0x20 || u == 0x7f || (u >= 0x80 && u < 0xa0)) c = '.';
+    }
+    return out;
+}
+
 // A request answered with an error before reaching the engine (no block - one line): 4xx the client's (warning),
 // 5xx the server's (error).
 void log_error(int64_t id, const httplib::Request &req, int status, const std::string &msg) {
     slog(status >= 500 ? LogLevel::Error : LogLevel::Warning, "Request %lld failed: %s %s from %s: %d - %s", (long long)id,
-         req.method.c_str(), req.path.c_str(), req.remote_addr.c_str(), status, msg.c_str());
-    slog(LogLevel::Info, "\xc2\xa0");  // a blank line after each request
+         req.method.c_str(), req.path.c_str(), req.remote_addr.c_str(), status, log_safe(msg).c_str());    slog(LogLevel::Info, "\xc2\xa0");  // a blank line after each request
 }
 
 // The top rows of a request's log block (GenerationRequest::log_header): where it came from and what it asked.
@@ -96,8 +106,10 @@ std::vector<std::pair<std::string, std::string>> header_rows(const httplib::Requ
     char from[256];
     std::snprintf(from, sizeof from, "%s, %s %s, %s KB, %s", req.remote_addr.c_str(), req.method.c_str(),
                   req.path.c_str(), fmt_rate(req.body.size() / 1e3, 1).c_str(), stream ? "streamed" : "not streamed");
-    // The model asked for is only logged: any name is served, and responses carry the real one.
-    return {{"from", from}, {"model", model.empty() ? "none requested" : "\"" + model + "\" requested"}};
+    // The model asked for is only logged (and log-safe: the name is the client's string): any name is served,
+    // and responses carry the real one.
+    return {{"from", from},
+            {"model", model.empty() ? "none requested" : "\"" + log_safe(model) + "\" requested"}};
 }
 
 // The max_tokens row: what the request gets, and why when that isn't what it asked for.

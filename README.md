@@ -166,6 +166,10 @@ curl -s localhost:5300/v1/chat/completions -H 'Content-Type: application/json' \
 
 Point any OpenAI-compatible client at `http://<your-machine>:5300/v1`, model `qwen3.8-flash-next`.
 
+The server also speaks `POST /v1/responses` - the OpenAI Responses wire Codex drives (stateless, streaming,
+tools, grammar-enforced output, raw reasoning): the contract, the examples above and a runnable Codex profile
+are in [What the server accepts](docs/server.md).
+
 > [!IMPORTANT]
 > The server has no authentication and listens on all interfaces (`host = 0.0.0.0` in `deploy/strix-server.conf`).
 > Run it on a trusted network, or set `host = 127.0.0.1`.

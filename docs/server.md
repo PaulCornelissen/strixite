@@ -140,7 +140,79 @@ can run the repaired call - complete when the call broke between parameters, wro
 value. Sent back in the conversation, a call whose arguments were left open this way is shown to the model with no
 parameters, rather than failing the request.
 
-## Responses (`POST /v1/responses`): reasoning
+## Responses (`POST /v1/responses`) - the Codex wire
+
+This endpoint speaks the OpenAI **Responses** API that Codex drives (the URL is versioned like OpenAI's,
+`/v1/responses`, so a provider `base_url` of `http://<host>:5300/v1` with `wire_api = "responses"` is all a
+client needs). It runs the same engine, queue, prompt cache, thinking and grammar machinery as Chat - it is a
+protocol surface, not a second server. It is **stateless**: responses are not stored, every request carries
+its full input (a `GET /v1/responses/{id}` gets a typed 404 that says so, `store: true` and
+`previous_response_id` are typed 400s).
+
+### The fields it serves
+
+| field | behavior |
+|---|---|
+| `model` | must name the model this server runs - a Responses client keys behavior off the name, so this route never pretends (unlike the Chat route, which serves any name and reports the real id) |
+| `input` | a string, or an array of items: `message` (roles `system`/`developer`/`user`/`assistant`), `function_call`, `custom_tool_call`, `function_call_output`, `custom_tool_call_output`, `reasoning` (validated, treated as display metadata - never replayed, never invented) |
+| `instructions` | prepended as a `system` message |
+| `tools` | `function` (flat `name`/`description`/`parameters`), `custom` (freeform, e.g. `apply_patch`), `namespace` groups; names checked against template/tag forgery (a control byte, `<`, `>` or `=` is a named 400) |
+| `tool_choice` | `"auto"` (default) or `"none"`; a named tool choice is a 400 (the server cannot force a call the model's template does not constrain) |
+| `parallel_tool_calls` | accepted as a shape marker: every call the model writes is published, there is no cap to lift |
+| `stream` | typed Responses SSE (see below) |
+| `store` | `false`/absent; `true` is a 400 (stateless) |
+| `max_output_tokens` | clamped to the room the context leaves, as Chat's `max_tokens` (the answer never truncates the prompt) |
+| `temperature`, `top_p`, `seed`, `stop` | the Chat sampling parameters, same ranges and clamps |
+| `reasoning` | `effort` (see the table below), `summary` accepted and ignored (raw reasoning streams; nothing is summarized) |
+| `include` | `["reasoning.encrypted_content"]` accepted - `encrypted_content` is always `null` (no key, no fake ciphertext); any other inclusion is a 400 |
+| `text.format` | `text`, `json_object`, `json_schema` (see structured output) |
+| `truncation` | `"disabled"` only: a prompt over the context is refused with a named 400, never silently cut |
+| `prompt_cache_key`, `client_metadata`, `metadata`, `user`, `safety_identifier` | validated benign client metadata (accepted, shape-checked, not behavior-changing) |
+
+**Any other field is a 400 naming it.** A field this endpoint would silently ignore is a semantic the client
+did not agree to - the strict list is deliberate (it also keeps protocol additions visible the day they appear).
+
+Hosted tools: `web_search` is **dropped from what the model sees, disclosed here** - installed Codex sends it
+by default and this server executes no hosted tools, so a refusal would make Codex unusable; every other
+hosted tool kind is a named 400.
+
+### Tools in, tools out
+
+Function tools replay and emit by their exact external name; namespaced tools by `namespace/child`; custom
+freeform tools carry one string `input` returned byte-for-byte (line endings, Unicode, patch boundaries). Tool
+call arguments are validated against the request's own registry before an item reaches the wire, and a call to
+a tool the request did not offer is a typed failure (`500` non-stream, `response.failed` mid-stream) - never a
+published call the client would run blind. Call ids (`call_*`) are preserved on every replay.
+
+### Streaming and the terminal
+
+`stream: true` emits typed Responses SSE: `response.created`, `response.in_progress`, per-item
+`output_item.added` / `content_part.added` / `reasoning_text`+`output_text` deltas / `.done` frames with
+contiguous `sequence_number` and matching `output_index`/`item_id`/`content_index`, SSE comments while the
+request waits in queue or prefills - and exactly one terminal: `response.completed` (with usage),
+`response.incomplete` (`incomplete_details.reason: "max_output_tokens"`, the last item marked `incomplete`),
+or `response.failed`. No Chat chunk shapes, no `[DONE]` sentinel. Tool items are buffered and published only
+complete - a partial call never reaches the wire.
+
+### Errors
+
+Every failure is one JSON object: `{"error": {"message", "type", "param", "code"}}` - `400`
+(`invalid_request_error`, `param` names the offending field), `404` (`not_found`), `413` (body over
+`--max-body-bytes`, refused before the handler), `500` (typed engine failure, `server_error`), `503`
+(submit refused: shutting down, the queue's post-fatal state, or the image preprocess gate; retryable where
+the message says so). The route is never a bare 404, and a Responses error body is never a Chat-shaped body.
+
+### Limits that are this server's truth
+
+- **No plaintext replay:** reasoning from earlier turns is not re-rendered (the template regenerates blocks for
+  kept turns only); conversation context - calls, results, text - is preserved exactly.
+- **No encrypted reasoning, no summaries:** the raw `reasoning_text` streams; `summary` is `[]`,
+  `encrypted_content` is `null`.
+- **No response store, no background mode, no WebSocket, no hosted tool execution.**
+- Custom-tool payloads are passed through, not grammar-checked: the server constrains the *shape* it returns,
+  not patch syntax (the client validates on apply, as Codex does).
+
+### Raw reasoning (and what it is not)
 
 The Responses endpoint (the wire Codex drives) streams the model's **raw** thinking, not a summary: the reasoning
 item carries a `reasoning_text` content part with exactly what the model wrote, `summary` is always the empty
@@ -170,7 +242,7 @@ Two honest limits:
 
 To see the thinking in Codex, set `show_raw_agent_reasoning = true` in `~/.codex/config.toml`.
 
-## Responses (`POST /v1/responses`): structured output and images
+### Structured output and images
 
 `text.format` lands on the same structured-output machinery the Chat route runs - the same compiler, the same
 grammar cache, the same keyword-level refusals:
@@ -199,3 +271,73 @@ other case is a named refusal, never a silent drop:
 The vision path through `/v1/responses` is the Chat route's pipeline verbatim (one shared implementation: same
 pad expansion, mRoPE walk, decode memo, preprocess gate); its behavior on a real tower is exercised on
 vision-served builds (the host test suite covers the parser rules and the vision-off refusals).
+
+### Trying it: the commands in this section, executed
+
+Against a server on `localhost:5300` (the `qwen3.8-flash-next` id below is what the reference build serves -
+`GET /v1/models` answers with the real id):
+
+```bash
+# the served model id (name it exactly in Responses requests)
+curl -s localhost:5300/v1/models
+
+# a plain turn
+curl -s localhost:5300/v1/responses -H 'Content-Type: application/json' -d '{
+  "model": "qwen3.8-flash-next",
+  "input": "Say hello in five words."
+}'
+
+# streaming (typed SSE; Ctrl-C ends the tail, the terminal event closes a full turn)
+curl -sN localhost:5300/v1/responses -H 'Content-Type: application/json' -d '{
+  "model": "qwen3.8-flash-next", "stream": true,
+  "input": "Count to three."
+}'
+
+# a function tool call
+curl -s localhost:5300/v1/responses -H 'Content-Type: application/json' -d '{
+  "model": "qwen3.8-flash-next", "input": "List files with exec_command.",
+  "tools": [{"type": "function", "name": "exec_command",
+             "description": "Run a shell command.",
+             "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}},
+                            "required": ["cmd"]}}]
+}'
+
+# structured output (grammar-enforced)
+curl -s localhost:5300/v1/responses -H 'Content-Type: application/json' -d '{
+  "model": "qwen3.8-flash-next", "input": "A one-line haiku about GPUs.",
+  "text": {"format": {"type": "json_schema", "name": "poem", "strict": true,
+           "schema": {"type": "object", "properties": {"text": {"type": "string"}},
+                      "required": ["text"], "additionalProperties": false}}}
+}'
+
+# the two named refusals worth seeing once
+curl -s localhost:5300/v1/responses/resp_any_id            # 404: stateless, nothing to fetch
+curl -s localhost:5300/v1/responses -H 'Content-Type: application/json' \
+     -d '{"model": "gpt-6", "input": "hi"}'               # 400: this runs its own model, by name
+```
+
+### A runnable Codex profile (`~/.codex/config.toml`)
+
+```toml
+[model_providers.strixite]
+name = "Strixite (local)"
+base_url = "http://127.0.0.1:5300/v1"
+wire_api = "responses"
+
+[profiles.strixite]
+model = "qwen3.8-flash-next"          # GET /v1/models answers the served id - name that
+model_provider = "strixite"
+show_raw_agent_reasoning = true       # the raw thinking streams; nothing is summarized here
+```
+
+`codex --profile strixite` then drives this endpoint: tools, streamed turns, multi-round calls. (Verified
+against codex-cli 0.162.1 request shapes; the live end-to-end run of this profile against the model needs the
+Strix Halo runtime - it is documented here, not claimed as executed on a host without weights.)
+
+### What is tested where
+
+The contract suites (`ctest -L contract`) cover the parser table, tool registry, history replay, the non-stream
+body, the SSE state machine (its emitted streams validated against the recorded Codex stream fixtures), the
+failure matrix and the live route on a scripted backend - all on any build host, no GPU. The same requests
+against the real model (turn quality, the live probe, the Codex loop, vision pixels) run on a served Strix
+Halo install: the gate B-series logs which of the two every claim rests on.

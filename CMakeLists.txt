@@ -285,6 +285,22 @@ target_link_libraries(check_responses_body PRIVATE strix_serve)
 # The Responses SSE state machine: event order/indices, lifecycle, tool buffering, single typed terminal.
 add_executable(check_responses_stream tools/check_responses_stream.cpp)
 target_link_libraries(check_responses_stream PRIVATE strix_serve)
+# Host contract tests (the /v1/responses + route suites): `ctest -L contract` runs the whole set. Every one
+# is pure host code - the scripted backend and the synthetic tokenizer fixture are generated in-process; no
+# model weights, no GPU, no network. check_stream_calls (the real tokenizer contract) is registered only when
+# STRIX_TEST_TOKENIZER names a checkpoint tokenizer.json.
+enable_testing()
+foreach(suite check_responses check_responses_norm check_responses_tools check_responses_custom
+              check_responses_history check_responses_body check_responses_reasoning check_responses_http)
+  add_test(NAME ${suite} COMMAND ${suite})
+  set_tests_properties(${suite} PROPERTIES LABELS contract WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+endforeach()
+add_test(NAME check_responses_stream COMMAND check_responses_stream ${CMAKE_CURRENT_BINARY_DIR}/test-streams)
+set_tests_properties(check_responses_stream PROPERTIES LABELS contract WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+if(STRIX_TEST_TOKENIZER)
+  add_test(NAME check_stream_calls COMMAND check_stream_calls ${STRIX_TEST_TOKENIZER})
+  set_tests_properties(check_stream_calls PROPERTIES LABELS contract WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
 
 # The Responses reasoning interop: effort table, Chat-parity budget semantics, emitter invariants.
 add_executable(check_responses_reasoning tools/check_responses_reasoning.cpp)

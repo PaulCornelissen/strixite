@@ -15,6 +15,7 @@
 #include "serve/responses_stream.hpp"
 
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -245,6 +246,8 @@ void check_unknown_tool_and_guards() {
 
 int main(int argc, char **argv) {
     if (argc > 1) g_dump_dir = argv[1];
+    std::error_code ec;
+    std::filesystem::create_directories(g_dump_dir, ec);  // the CTest dump dir is created, not assumed
     try {
         check_mixed();
         check_multi_tool_zero_text();
