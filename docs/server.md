@@ -197,10 +197,12 @@ complete - a partial call never reaches the wire.
 ### Errors
 
 Every failure is one JSON object: `{"error": {"message", "type", "param", "code"}}` - `400`
-(`invalid_request_error`, `param` names the offending field), `404` (`not_found`), `413` (body over
-`--max-body-bytes`, refused before the handler), `500` (typed engine failure, `server_error`), `503`
+(`invalid_request_error`, `param` names the offending field), `404` (`not_found`), `413` (body over the server's request-size limit
+(64 MB default), refused before the handler), `500` (typed engine failure, `server_error`), `503`
 (submit refused: shutting down, the queue's post-fatal state, or the image preprocess gate; retryable where
-the message says so). The route is never a bare 404, and a Responses error body is never a Chat-shaped body.
+the message says so), and `408` (`api_error` with `x-should-retry: true`): a POST whose body stops arriving
+within `request-read-timeout-s` is turned into the retryable timeout before any route runs. The route is never
+a bare 404, and a Responses error body is never a Chat-shaped body.
 
 ### Limits that are this server's truth
 
