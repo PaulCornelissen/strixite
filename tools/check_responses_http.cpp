@@ -117,68 +117,122 @@ std::string synthetic_tokenizer_json() {
 
 class ScriptedLmBackend : public LmBackend {
 public:
-    explicit ScriptedLmBackend(int32_t vocab, std::vector<int32_t> script)
-        : vocab_(vocab), script_(std::move(script)) {}
+    // n_seqs > 1 puts the engine in its real multi-slot mode (v0.5.0): one worker thread per slot, every
+    // call through the SeqBackend proxy's seq overloads. Each seq keeps its own position and its own replay
+    // cursor, so a request on any slot gets the FULL script - the per-slot lifecycle assertions stay
+    // deterministic. All state is under one mutex (the slot workers are real threads).
+    ScriptedLmBackend(int32_t vocab, std::vector<int32_t> script, int n_seqs = 1)
+        : vocab_(vocab), n_seqs_(n_seqs), script_(std::move(script)) {
+        seqs_.resize((size_t)(n_seqs > 0 ? n_seqs : 1));
+    }
 
     int64_t capacity() const override { return 8192; }
     int64_t max_chunk() const override { return max_chunk_.load(); }
     int64_t logits_row() const override { return vocab_; }
-    int64_t pos() const override { return pos_; }
-    void reset() override { pos_ = 0; at_ = 0; }
+    int n_seqs() const override { return n_seqs_; }
+    int64_t pos() const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        return seqs_[0].pos;
+    }
+    int64_t pos(int seq) const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        return seqs_[(size_t)seq].pos;
+    }
+    void reset() override {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (Seq &s : seqs_) s = Seq();
+    }
+    void reset(int seq) override {
+        std::lock_guard<std::mutex> lk(mu_);
+        seqs_[(size_t)seq] = Seq();
+    }
     std::vector<float> forward(const std::vector<int32_t> &ids, bool want_logits) override {
-        // The failure/cancellation knobs (STORY-10): a per-forward delay (keepalive cadence, mid-stream
-        // disconnect), and a simulated engine failure - plain (one request fails, the server keeps running)
-        // or GPU-fatal (the context is lost: this request 500s, every later submit is refused with 503).
-        const int64_t n = ++forwards_;
-        const int64_t ta = throw_after_.load(), tf = throw_fatal_.load();
-        if (ta >= 0 && n > ta) throw std::runtime_error("scripted backend: simulated engine failure");
-        if (tf >= 0 && n > tf) throw GpuFatalError("scripted backend: simulated GPU context loss");
-        const int64_t d = delay_us_.load();
-        if (d > 0) std::this_thread::sleep_for(std::chrono::microseconds(d));
-        pos_ += (int64_t)ids.size();
-        if (!want_logits) return {};
-        // The script answers every request of the session: replay it when spent (a resumed request re-opens
-        // the think block and expects the full answer again); the end-of-turn token ends each turn.
-        if (at_ >= (int64_t)script_.size()) at_ = 0;
-        const int32_t tok = script_[at_++];
-        std::vector<float> row((size_t)vocab_, 0.0f);
-        row[(size_t)tok] = 10.0f;
-        return row;
+        std::lock_guard<std::mutex> lk(mu_);
+        step(0, ids, want_logits);
+        return want_logits ? row(0) : std::vector<float>{};
     }
-    void save_snapshot(int slot) override {
-        snap_[slot] = pos_;
-        if (slot == kTurnSlot) at_ = 0;  // the prompt's turn snapshot: a new request starts - replay the script
+    LogitRows forward_rows(int seq, const std::vector<int32_t> &ids, int64_t n_logits, bool, int64_t,
+                           const LogitMasks *masks) override {
+        std::lock_guard<std::mutex> lk(mu_);
+        STRIX_CHECK(masks == nullptr, "scripted backend: these tests run no masked verifies");
+        const bool want = n_logits != 0;  // the proxy's forward(ids, false) arrives as n_logits 0 (a prefill)
+        step(seq, ids, want);
+        return LogitRows::from_full(want ? row(seq) : std::vector<float>{}, (int64_t)vocab_);
     }
-    int64_t snapshot_pos(int slot) const override { return snap_[slot]; }
-    bool can_restore_snapshot(int slot) const override { return snap_[slot] >= 0 && snap_[slot] <= pos_; }
-    void restore_snapshot(int slot) override {
-        at_ = 0;  // a restore precedes a new request's suffix prefill: replay the script for it
-        if (can_restore_snapshot(slot)) pos_ = snap_[slot];
+    void save_snapshot(int slot) override { save_snapshot(0, slot); }
+    void save_snapshot(int seq, int slot) override {
+        std::lock_guard<std::mutex> lk(mu_);
+        Seq &s = seqs_[(size_t)seq];
+        s.snap[slot] = s.pos;
+        if (slot == kTurnSlot) s.at = 0;  // the prompt's turn snapshot: a new request replays the script
+    }
+    int64_t snapshot_pos(int slot) const override { return snapshot_pos(0, slot); }
+    int64_t snapshot_pos(int seq, int slot) const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        return seqs_[(size_t)seq].snap[slot];
+    }
+    bool can_restore_snapshot(int slot) const override { return can_restore_snapshot(0, slot); }
+    bool can_restore_snapshot(int seq, int slot) const override {
+        std::lock_guard<std::mutex> lk(mu_);
+        const Seq &s = seqs_[(size_t)seq];
+        return s.snap[slot] >= 0 && s.snap[slot] <= s.pos;
+    }
+    void restore_snapshot(int slot) override { restore_snapshot(0, slot); }
+    void restore_snapshot(int seq, int slot) override {
+        std::lock_guard<std::mutex> lk(mu_);
+        Seq &s = seqs_[(size_t)seq];
+        s.at = 0;  // a restore precedes a new request's suffix prefill: replay the script for it
+        if (s.snap[slot] >= 0 && s.snap[slot] <= s.pos) s.pos = s.snap[slot];
     }
     void export_snapshot(int, HostBuffer &out, int64_t) override { out.resize(0); }
     uint64_t snapshot_bytes(int, int64_t) const override { return 0; }
-    void import_state(const HostBuffer &, int64_t n, int64_t) override { pos_ = n; }
+    void import_state(const HostBuffer &, int64_t n, int64_t) override {
+        std::lock_guard<std::mutex> lk(mu_);
+        seqs_[0].pos = n;
+    }
     std::string state_fingerprint() const override { return "scripted-host-test"; }
     std::string describe() const override { return "ScriptedLmBackend(host test)"; }
     // Swap the scripted answer (the route test drives text and tool-call turns on one backend).
     void set_script(std::vector<int32_t> script) {
         std::lock_guard<std::mutex> lk(mu_);
         script_ = std::move(script);
-        at_ = 0;
+        for (Seq &s : seqs_) s.at = 0;
     }
     // Failure/cancel choreography (STORY-10): counters are forwards since the last set_* (each scenario
     // re-arms right before its request, so the numbers are deterministic on the serialized engine).
     void set_delay_us(int64_t us) { forwards_ = 0; delay_us_.store(us); }
     void set_max_chunk(int64_t n) { max_chunk_.store(n); }
-    void set_throw_after(int64_t n) { forwards_ = 0; throw_after_.store(n); }   // -1: off
-    void set_throw_fatal(int64_t n) { forwards_ = 0; throw_fatal_.store(n); }   // -1: off
+    void set_throw_after(int64_t n) { forwards_ = 0; throw_after_.store(n); }  // -1: off
+    void set_throw_fatal(int64_t n) { forwards_ = 0; throw_fatal_.store(n); }  // -1: off
 
 private:
+    struct Seq {
+        int64_t pos = 0, at = 0;
+        int64_t snap[4] = {-1, -1, -1, -1};
+    };
+    void step(int seq, const std::vector<int32_t> &ids, bool want_logits) {  // mu_ held
+        const int64_t n = ++forwards_;
+        const int64_t ta = throw_after_.load(), tf = throw_fatal_.load();
+        if (ta >= 0 && n > ta) throw std::runtime_error("scripted backend: simulated engine failure");
+        if (tf >= 0 && n > tf) throw GpuFatalError("scripted backend: simulated GPU context loss");
+        const int64_t d = delay_us_.load();
+        if (d > 0) std::this_thread::sleep_for(std::chrono::microseconds(d));
+        seqs_[(size_t)seq].pos += (int64_t)ids.size();
+        (void)want_logits;
+    }
+    std::vector<float> row(int seq) {  // mu_ held; the script answers every request of the session: replay
+        Seq &s = seqs_[(size_t)seq];   // it when spent (a resumed request re-opens the think block)
+        if (s.at >= (int64_t)script_.size()) s.at = 0;
+        const int32_t tok = script_[(size_t)(s.at++)];
+        std::vector<float> r((size_t)vocab_, 0.0f);
+        r[(size_t)tok] = 10.0f;
+        return r;
+    }
     int32_t vocab_;
+    int n_seqs_;
+    std::vector<Seq> seqs_;
     std::vector<int32_t> script_;
-    int64_t at_ = 0, pos_ = 0;
-    std::mutex mu_;
-    int64_t snap_[4] = {-1, -1, -1, -1};
+    mutable std::mutex mu_;  // the const accessors (pos/snapshot_pos/can_restore) lock it too
     std::atomic<int64_t> delay_us_{0}, max_chunk_{512}, throw_after_{-1}, throw_fatal_{-1}, forwards_{0};
 };
 
@@ -987,6 +1041,121 @@ void check_failure_phase(const std::string &tok_path, const std::string &model_i
     thr.join();
 }
 
+// The multi-slot engine (upstream v0.5.0) under the Responses route: real concurrent slot workers
+// (n_seqs() == 2), requests in flight at once, tokens interleaving through the shared backend. The route's
+// per-request state - sink, ResponsesStream, registry, schema owner - must be untouched by that: every
+// stream gets its own complete lifecycle, its own completed items, and nothing leaks across. Scripted
+// backend, no GPU; this is a route-concurrency proof, not model behavior.
+void check_multislot_phase(const std::string &tok_path, const std::string &model_id) {
+    Tokenizer tok(tok_path);
+    const int32_t im_end = tok.id_of(sp("im_end").c_str());
+    std::vector<int32_t> text_script;
+    for (char c : std::string_view("thinking\n")) text_script.push_back(tok.byte_token((uint8_t)c));
+    text_script.push_back(tok.id_of(tagc("think").c_str()));
+    for (char c : std::string_view(" Hello world")) text_script.push_back(tok.byte_token((uint8_t)c));
+    text_script.push_back(im_end);
+    std::vector<int32_t> tool_script;
+    tool_script.push_back(tok.id_of(tag("tool_call").c_str()));
+    for (char c : std::string_view("\n<function=f>\n<parameter=x>\n1\n</parameter>\n</function>\n"))
+        tool_script.push_back(tok.byte_token((uint8_t)c));
+    tool_script.push_back(tok.id_of(tagc("tool_call").c_str()));
+    tool_script.push_back(im_end);
+
+    ScriptedLmBackend be(tok.size(), text_script, 2);  // two conversations at once, like the shipped default
+    Engine::Options options;
+    options.think_nudge = false;
+    Engine engine(be, tok, options);
+    ServerConfig cfg;
+    cfg.port = 0;
+    cfg.model_id = model_id;
+    HttpServer server(engine, tok, cfg);
+    const int port = server.bind();
+    STRIX_CHECK(port > 0, "phase-3 bind failed");
+    std::thread thr([&] { server.serve(); });
+    try {
+        const std::string sbody =
+            "{\"model\":\"" + model_id + "\",\"input\":\"hi\",\"stream\":true,\"max_output_tokens\":64}";
+        {  // Six streaming text turns at once: each stream completes its OWN lifecycle, content intact.
+            constexpr int n = 6;
+            std::atomic<int> ready{0};
+            std::atomic<bool> go{false};
+            std::vector<std::thread> ths;
+            std::vector<int> okc(n, 0);
+            for (int i = 0; i < n; ++i)
+                ths.emplace_back([&, i] {
+                    httplib::Client c("127.0.0.1", port);
+                    c.set_read_timeout(30, 0);
+                    if (++ready == n) go = true;
+                    while (!go.load()) std::this_thread::yield();
+                    std::string acc;
+                    auto r = c.Post("/v1/responses", httplib::Headers{}, sbody, "application/json",
+                                    [&](const char *d, size_t l) { acc.append(d, l); return true; });
+                    (void)r;
+                    // exactly one terminal, it is completed, and the answer text is this stream's own
+                    size_t terminals = 0;
+                    for (const char *term : {"\"type\":\"response.completed\"", "\"type\":\"response.incomplete\"",
+                                             "\"type\":\"response.failed\""})
+                        for (size_t p = acc.find(term); p != std::string::npos; p = acc.find(term, p + 1))
+                            ++terminals;
+                    okc[i] = terminals == 1 &&
+                                     acc.find("\"type\":\"response.completed\"") != std::string::npos &&
+                                     acc.find("Hello world") != std::string::npos &&
+                                     acc.find("data: [DONE]") == std::string::npos;
+                });
+            for (auto &th : ths) th.join();
+            int good = 0;
+            for (int i = 0; i < n; ++i) good += okc[i];
+            ok(good == n, "six streaming turns across two live slots: one terminal + completed + own text each, got ",
+               good);
+        }
+        {  // Two tool-call turns at once (both offer f): each gets its own completed call item, no cross-talk.
+            be.set_script(tool_script);
+            const std::string tbody =
+                "{\"model\":\"" + model_id + "\",\"input\":\"run f\",\"stream\":true,\"max_output_tokens\":64,"
+                "\"tools\":[{\"type\":\"function\",\"name\":\"f\",\"parameters\":{\"type\":\"object\"}}]}";
+            std::atomic<int> ready{0};
+            std::atomic<bool> go{false};
+            std::vector<std::thread> ths;
+            std::vector<int> done(2, 0);
+            for (int i = 0; i < 2; ++i)
+                ths.emplace_back([&, i] {
+                    httplib::Client c("127.0.0.1", port);
+                    c.set_read_timeout(30, 0);
+                    if (++ready == 2) go = true;
+                    while (!go.load()) std::this_thread::yield();
+                    std::string acc;
+                    auto r = c.Post("/v1/responses", httplib::Headers{}, tbody, "application/json",
+                                    [&](const char *d, size_t l) { acc.append(d, l); return true; });
+                    (void)r;
+                    done[i] = acc.find("\"type\":\"response.completed\"") != std::string::npos &&
+                              acc.find("\"name\":\"f\"") != std::string::npos &&
+                              acc.find("call_") != std::string::npos && acc.find("response.failed") == std::string::npos;
+                });
+            for (auto &th : ths) th.join();
+            ok(done[0] && done[1], "concurrent tool turns: each stream completes with its own call + id");
+            be.set_script(text_script);
+        }
+        {  // And the server is a healthy one after the storm.
+            httplib::Client cli("127.0.0.1", port);
+            cli.set_read_timeout(20, 0);
+            auto res = cli.Post("/v1/responses",
+                                "{\"model\":\"" + model_id + "\",\"input\":\"after\",\"max_output_tokens\":64}",
+                                "application/json");
+            ok(res && res->status == 200 && res->body.find("\"status\":\"completed\"") != std::string::npos,
+               "a single turn after the concurrency storm completes, got ",
+               res ? std::to_string(res->status) : "none");
+            auto h = cli.Get("/health");
+            ok(h && h->status == 200, "/health 200 after the storm");
+        }
+    } catch (const std::exception &e) {
+        ++checks;
+        ++failures;
+        std::printf("FAIL (phase-3 unhandled): %s\n", e.what());
+    }
+    server.stop();
+    thr.join();
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -1036,6 +1205,7 @@ int main(int argc, char **argv) {
         server.stop();
         thr.join();
         check_failure_phase(tok_path, cfg.model_id);
+        check_multislot_phase(tok_path, cfg.model_id);
     } catch (const std::exception &e) {
         std::printf("FAIL (unhandled): %s\n", e.what());
         return 2;
