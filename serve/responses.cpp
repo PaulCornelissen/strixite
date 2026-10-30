@@ -204,7 +204,9 @@ json::Value normalize_item(const json::Value &item, size_t k, bool vision_enable
 // no id repeats, no output crosses a text message, a dangling call is refused at the next message (the final
 // turn may end on calls the client aborted: the transcript is still unambiguous). The registry is consulted for
 // shape only when the tool is CURRENTLY offered - a historical call whose tool is not in this request's tools
-// replays fine (the template renders the name; no live tool is needed to render the past).
+// replays fine (the template renders the name; no live tool is needed to render the past). Call items carry the
+// emitted {namespace, name} parts, reconstructed to the flat registry name "namespace/name" (review B2), so a
+// replayed namespaced call keeps the identity the model used.
 
 struct HistoryState {
     long asst = -1;                                   // the open assistant message (receives calls), -1: none
@@ -223,8 +225,27 @@ void append_call_item(const json::Value &item, size_t k, const char *kind, std::
     const std::string call_id = cid->as_string("call_id");
     const json::Value *name = item.find("name");
     if (!is_string(name)) bad("input", "'" + path + "' needs a string 'name'");
-    const std::string &n = name->as_string("name");
-    check_tool_name(n, "input");  // the name rides into the template's <function=NAME> markup: the tool rules
+    const std::string &plain = name->as_string("name");
+    check_tool_name(plain, "input");  // the name rides into the template's <function=NAME> markup: the tool rules
+    // External review B2 (2026-10-27): a namespaced call is EMITTED as {namespace:"ns", name:"plain"}, so a
+    // replayed item carries the parts - the model-facing flat name (the registry key, what the model wrote in
+    // <function=ns/plain>) is "ns/plain". Reconstruct it: the plain name alone renames the tool and can collide
+    // with a top-level tool of that name. namespace:""/null is the absent form (SDKs send explicit empties); a
+    // malformed namespace is a named 400, never a silent drop of the prefix; flat+namespace is idempotent.
+    std::string ns;
+    if (const json::Value *v = item.find("namespace"); v && !v->is_null()) {
+        if (!is_string(v)) bad("input", "'" + path + ".namespace' must be a string");
+        ns = v->as_string(path + ".namespace");
+    }
+    if (!ns.empty()) {
+        if (std::string(kind) == "custom")
+            bad("input", "'" + path + "' (a custom call) has no namespace (custom tools are top-level)");
+        check_tool_name(ns, "input");
+    }
+    std::string n = plain;
+    if (!ns.empty() && !(n.size() > ns.size() + 1 && n.compare(0, ns.size(), ns) == 0 && n[ns.size()] == '/'))
+        n = ns + "/" + n;  // canonical external form (idempotent when the flat name was sent whole)
+    check_tool_name(n, "input");  // the joined name is what the template renders: same markup-safety rules
     if (!st.ids.insert(call_id).second)
         bad("input", "'" + path + "': duplicate call_id '" + call_id + "' (a transcript pairs every call uniquely)");
     for (const auto &e : registry.as_array("registry"))  // shape check when the tool is currently offered

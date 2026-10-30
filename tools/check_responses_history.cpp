@@ -223,6 +223,118 @@ void check_two_turn_fixture(const json::Value &fixture) {
        "the outputs render as tool responses");
 }
 
+
+// --- external review B2 (2026-10-27): namespaced call items keep their identity in history --------------------
+// A response emits a namespace child as {namespace:"ns", name:"plain"}; the flat model-facing name is
+// "ns/plain" (the registry key, what the model wrote in <function=ns/plain>). Replaying the emitted item
+// must restore the FLAT name in the ChatRequest and in the rendered prompt - the plain name alone changes
+// the tool's identity (and can collide with a top-level tool of that plain name).
+
+void check_namespaced_history() {
+    // The tool as Codex registers it (the capture's multi_agent_v1/spawn_agent) and the item the route emitted.
+    const std::string tools =
+        R"JX("tools":[{"type":"namespace","name":"multi_agent_v1","tools":[{"type":"function","name":"spawn_agent",)JX"
+        R"JX("parameters":{"type":"object","properties":{}}}]}])JX";
+    const std::string ns_call =
+        R"JX({"type":"function_call","namespace":"multi_agent_v1","name":"spawn_agent","call_id":"c1","arguments":"{}"},)JX";
+    const std::string out1 = R"JX({"type":"function_call_output","call_id":"c1","output":"agent 7 started"},)JX";
+    const std::string user = R"JX({"type":"message","role":"user","content":"spawn a helper"},)JX";
+
+    {  // the review's regression: replay the emitted {namespace, name} item -> flat name in the ChatRequest
+        const std::string q = R"JX({"model":"qwen3.8-flash-next","input":[)JX" + user + ns_call + out1 +
+                              R"JX({"type":"message","role":"user","content":"and report"}],)JX" + tools + "}";
+        ResponsesRequest r = parse(q);
+        const json::Value *c = call0(r, 1);
+        ok(c != nullptr, "the replayed namespaced call is on the assistant turn");
+        if (c)
+            ok(c->find("function")->find("name")->as_string("name") == "multi_agent_v1/spawn_agent",
+               "the namespaced replay restores the flat model-facing name, got ",
+               c->find("function")->find("name")->as_string("name"));
+        // and the model actually sees it: the rendered prompt carries the flat name, not the plain one
+        ChatTemplateOptions opt;
+        opt.enable_thinking = false;
+        const std::string p = render_chat(r.chat.messages, &r.chat.tools, opt);
+        ok(p.find("<function=multi_agent_v1/spawn_agent>") != std::string::npos,
+           "the rendered prompt carries the flat namespaced name");
+        ok(p.find("<function=spawn_agent>\n") == std::string::npos,
+           "the plain name alone never renders for a namespaced tool");
+        ok(p.find("agent 7 started") != std::string::npos, "the output replays on the same round");
+    }
+    {  // the tool is NOT currently offered: history identity survives all the same (the review's explicit ask)
+        const std::string q = R"JX({"model":"qwen3.8-flash-next","input":[)JX" + user + ns_call + out1.substr(0, out1.size() - 1) + "]}";
+        ResponsesRequest r = parse(q);
+        const json::Value *c = call0(r, 1);
+        ok(c && c->find("function")->find("name")->as_string("name") == "multi_agent_v1/spawn_agent",
+           "a historical namespaced call keeps its flat name with no registry to consult");
+    }
+    {  // collision handling: a client that replays the FLAT name with namespace set must not double the prefix
+        const std::string q = R"JX({"model":"qwen3.8-flash-next","input":[)JX" + user +
+                              R"JX({"type":"function_call","namespace":"multi_agent_v1","name":"multi_agent_v1/spawn_agent",)JX"
+                              R"JX("call_id":"c1","arguments":"{}"},)JX" + out1.substr(0, out1.size() - 1) + "]," + tools + "}";
+        ResponsesRequest r = parse(q);
+        const json::Value *c = call0(r, 1);
+        ok(c && c->find("function")->find("name")->as_string("name") == "multi_agent_v1/spawn_agent",
+           "flat name + its own namespace is idempotent, got ",
+           (c ? c->find("function")->find("name")->as_string("name") : "?"));
+    }
+    {  // a flat replay WITHOUT the namespace field is the same tool (the registry key form): accepted as-is
+        const std::string q = R"JX({"model":"qwen3.8-flash-next","input":[)JX" + user +
+                              R"JX({"type":"function_call","name":"multi_agent_v1/spawn_agent","call_id":"c1","arguments":"{}"},)JX"
+                              + out1.substr(0, out1.size() - 1) + "]," + tools + "}";
+        ResponsesRequest r = parse(q);
+        const json::Value *c = call0(r, 1);
+        ok(c && c->find("function")->find("name")->as_string("name") == "multi_agent_v1/spawn_agent",
+           "a flat-form replay matches the namespaced registry entry");
+    }
+    {  // namespace:"" is the absent form (SDKs send explicit empties/nulls)
+        const std::string q = R"JX({"model":"qwen3.8-flash-next","input":[)JX" + user +
+                              R"JX({"type":"function_call","namespace":"","name":"plain","call_id":"c1","arguments":"{}"},)JX"
+                              + out1.substr(0, out1.size() - 1) + "]}";
+        ResponsesRequest r = parse(q);
+        const json::Value *c = call0(r, 1);
+        ok(c && c->find("function")->find("name")->as_string("name") == "plain", "an empty namespace is a no-op");
+        const std::string qn = R"JX({"model":"qwen3.8-flash-next","input":[)JX" + user +
+                               R"JX({"type":"function_call","namespace":null,"name":"plain","call_id":"c1","arguments":"{}"},)JX"
+                               + out1.substr(0, out1.size() - 1) + "]}";
+        ResponsesRequest rn = parse(qn);
+        const json::Value *cn = call0(rn, 1);
+        ok(cn && cn->find("function")->find("name")->as_string("name") == "plain", "a null namespace is a no-op");
+    }
+    {  // the registry shape check runs on the FLAT name: a namespaced function answered as a custom call refused
+        expect_400(R"JX({"model":"qwen3.8-flash-next","input":[)JX" + user +
+                       R"JX({"type":"custom_tool_call","namespace":"multi_agent_v1","name":"spawn_agent","call_id":"c1","input":"x"},)JX"
+                       + out1.substr(0, out1.size() - 1) + "]," + tools + "}",
+                   "a custom_tool_call carrying a namespace refused (custom tools are never namespaced)");
+        expect_400(R"JX({"model":"qwen3.8-flash-next","input":[)JX" + user +
+                       R"JX({"type":"function_call","namespace":"multi_agent_v1","name":"spawn_agent","call_id":"c1","arguments":"{}"},)JX"
+                       + out1.substr(0, out1.size() - 1) + R"JX(],"tools":[{"type":"custom","name":"multi_agent_v1/spawn_agent"}]})JX",
+                   "a namespaced replay colliding with an offered custom tool of that flat name refused");
+        {  // the converse: an offered CUSTOM tool named "spawn_agent" is a DIFFERENT tool - the namespaced
+          // replay is not a collision (the reconstruction made the identity explicit), so it replays fine
+            ResponsesRequest ok_r = parse(R"JX({"model":"qwen3.8-flash-next","input":[)JX" + user + ns_call +
+                                         out1.substr(0, out1.size() - 1) +
+                                         R"JX(],"tools":[{"type":"custom","name":"spawn_agent"}]})JX");
+            const json::Value *c = call0(ok_r, 1);
+            ok(c && c->find("function")->find("name")->as_string("name") == "multi_agent_v1/spawn_agent",
+               "a plain-name custom tool does not shadow the namespaced replay identity");
+        }
+    }
+    {  // malformed namespaces are named 400s, never a silent drop of the prefix
+        expect_400(R"JX({"model":"qwen3.8-flash-next","input":[)JX" + user +
+                       R"JX({"type":"function_call","namespace":7,"name":"f","call_id":"c1","arguments":"{}"},)JX" + out1.substr(0, out1.size() - 1) +
+                       "]}",
+                   "a non-string namespace refused");
+        expect_400(R"JX({"model":"qwen3.8-flash-next","input":[)JX" + user +
+                       R"JX({"type":"function_call","namespace":"bad ns","name":"f","call_id":"c1","arguments":"{}"},)JX"
+                       + out1.substr(0, out1.size() - 1) + "]}",
+                   "a namespace with a space refused (template markup safety)");
+        expect_400(R"JX({"model":"qwen3.8-flash-next","input":[)JX" + user +
+                       R"JX({"type":"function_call","namespace":"a<b","name":"f","call_id":"c1","arguments":"{}"},)JX"
+                       + out1.substr(0, out1.size() - 1) + "]}",
+                   "a namespace with '<' refused");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -234,6 +346,7 @@ int main(int argc, char **argv) {
         check_pairing_rules();
         check_historical_tool_absent();
         check_reasoning_metadata();
+        check_namespaced_history();
         std::ifstream in(path);
         STRIX_CHECK(in.is_open(), "cannot read the history fixture '", path, "'");
         std::ostringstream ss;

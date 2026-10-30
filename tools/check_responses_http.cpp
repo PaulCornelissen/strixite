@@ -487,6 +487,53 @@ void check_routes(httplib::Client &cli, const std::string &model_id, const Token
             ok(fc->find("arguments")->as_string("arguments") == "{\"x\":1}", "arguments typed from the schema, as JSON text");
         }
     }
+    {  // External review B2 (2026-10-27), full wire round trip: the model calls a namespace child; the
+       // response publishes it split as {namespace, name} (the wire contract), and replaying that published
+       // item + its output as history completes on the route. The flat identity is restored at parse
+       // (render-level proof: check_responses_history renders <function=multi_agent_v1/spawn_agent>).
+        std::vector<int32_t> ns_script;
+        ns_script.push_back(tok.id_of(tag("tool_call").c_str()));
+        for (char c : std::string_view(
+                 "\n<function=multi_agent_v1/spawn_agent>\n<parameter=task>\nhelp\n</parameter>\n</function>\n"))
+            ns_script.push_back(tok.byte_token((uint8_t)c));
+        ns_script.push_back(tok.id_of(tagc("tool_call").c_str()));
+        ns_script.push_back(im_end);
+        be.set_script(ns_script);
+        auto res = cli.Post("/v1/responses",
+                            "{\"model\":\"" + model_id + "\",\"input\":\"spawn a helper\",\"max_output_tokens\":256,"
+                            "\"tools\":[{\"type\":\"namespace\",\"name\":\"multi_agent_v1\",\"tools\":"
+                            "[{\"type\":\"function\",\"name\":\"spawn_agent\",\"parameters\":{\"type\":\"object\","
+                            "\"properties\":{\"task\":{\"type\":\"string\"}}}}]}]}",
+                            "application/json");
+        ok(res && res->status == 200, "the namespaced tool call completes, got ",
+           res ? std::to_string(res->status) : "none", res ? " body " + res->body.substr(0, 240) : "");
+        if (!res || res->status != 200) return;
+        json::Value b = json::Value::parse(res->body);
+        const json::Value *fc = nullptr;
+        for (const auto &it : b.find("output")->as_array("output"))
+            if (it.find("type") && it.find("type")->as_string("type") == "function_call") fc = &it;
+        ok(fc != nullptr, "the namespaced call is published");
+        if (fc)
+            ok(fc->find("name")->as_string("name") == "spawn_agent" &&
+                       fc->find("namespace") && fc->find("namespace")->as_string("ns") == "multi_agent_v1",
+               "published split as {namespace, name} (the Codex wire shape)");
+        // Replay the published item exactly as published (that is Codex's next request) plus its output.
+        std::string replay = "{\"model\":\"" + model_id + "\",\"max_output_tokens\":256,\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":\"spawn a helper\"}," +
+                             fc->dump() +
+                             ",{\"type\":\"function_call_output\",\"call_id\":\"" +
+                                 fc->find("call_id")->as_string("call_id") + "\",\"output\":\"agent 7 started\"},"
+                             "{\"type\":\"message\",\"role\":\"user\",\"content\":\"and now?\"}],";
+        replay += "\"tools\":[{\"type\":\"namespace\",\"name\":\"multi_agent_v1\",\"tools\":"
+                  "[{\"type\":\"function\",\"name\":\"spawn_agent\",\"parameters\":{\"type\":\"object\","
+                  "\"properties\":{\"task\":{\"type\":\"string\"}}}}]}]}";
+        be.set_script(text_script);
+        auto res2 = cli.Post("/v1/responses", replay, "application/json");
+        ok(res2 && res2->status == 200, "replaying the published namespaced item completes on the route, got ",
+           res2 ? std::to_string(res2->status) + " " + res2->body.substr(0, 200) : "none");
+        if (res2 && res2->status == 200)
+            ok(json::Value::parse(res2->body).find("status")->as_string("st") == "completed",
+               "the replayed namespaced turn completes typed");
+    }
     {  // Streaming on the route (STORY-08): typed Responses SSE through the live pipeline.
         be.set_script(text_script);  // the tool POST above left the call script armed
         std::string acc;

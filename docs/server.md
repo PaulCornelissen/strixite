@@ -178,7 +178,8 @@ hosted tool kind is a named 400.
 
 ### Tools in, tools out
 
-Function tools replay and emit by their exact external name; namespaced tools by `namespace/child`; custom
+Function tools replay and emit by their exact external name; namespaced tools by `namespace/child` (emitted
+split as `{namespace, name}`, replayed either split - the flat model-facing name is restored - or whole); custom
 freeform tools carry one string `input` returned byte-for-byte (line endings, Unicode, patch boundaries). Tool
 call arguments are validated against the request's own registry before an item reaches the wire, and a call to
 a tool the request did not offer is a typed failure (`500` non-stream, `response.failed` mid-stream) - never a
