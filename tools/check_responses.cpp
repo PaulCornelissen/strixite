@@ -69,16 +69,19 @@ void check_real_codex_request(const json::Value &fixture) {
     ok(r.chat.model == kModel, "the model echoes the served id");
 
     // input: [developer instructions, developer skills, user environment_context, user prompt] in order. The
-    // template's roles are system/user/assistant/tool, so developer items normalize to system, order kept -
-    // developer context is never dropped and never reordered.
+    // template's roles are system/user/assistant/tool; developer items normalize to system, and the leading
+    // system run merges to ONE (B1: the template accepts one leading system - the Chat route's rule, shared).
     const auto &msgs = r.chat.messages.as_array("chat.messages");
-    ok(msgs.size() == 4, "4 input items -> 4 chat messages, got ", msgs.size());
-    ok(msgs[0].find("role")->as_string("role") == "system" &&
-               msgs[1].find("role")->as_string("role") == "system",
-       "developer items normalize to system messages in order");
-    ok(msgs[2].find("role")->as_string("role") == "user" && msgs[3].find("role")->as_string("role") == "user",
+    ok(msgs.size() == 3, "the leading developer pair merges: 4 items -> 3 chat messages, got ", msgs.size());
+    ok(msgs[0].find("role")->as_string("role") == "system", "the merged leading system is first");
+    const std::string &sys = msgs[0].find("content")->as_string("content");
+    ok(sys.find("coding agent") != std::string::npos, "the developer instructions text is kept in the merged system");
+    ok(sys.find("<skills_instructions>") != std::string::npos &&
+               sys.find("coding agent") < sys.find("<skills_instructions>"),
+       "both developer texts merged in their original order (blank-line joined)");
+    ok(msgs[1].find("role")->as_string("role") == "user" && msgs[2].find("role")->as_string("role") == "user",
        "user items keep their role and order");
-    ok(msgs[3].find("content")->as_string("content").find("one word: hello") != std::string::npos,
+    ok(msgs[2].find("content")->as_string("content").find("one word: hello") != std::string::npos,
        "the user's prompt text reaches the last message intact");
 
     // tools: 4 functions + 5 namespaced children = 9 model-callable tools; the hosted web_search is not executed
@@ -350,6 +353,57 @@ void check_structured_and_images() {
     }
 }
 
+
+// --- external review B1 (2026-10-27): leading developer/system messages render as ONE system, a
+// mid-conversation one is a named 400. Codex's real captured request opens with TWO developer messages -
+// the template accepts a single leading system, so parse-only proof hid a request that fails at render.
+
+void check_leading_system() {
+    const std::string m = kModel;
+    {  // the fixture shape: two leading developer messages + user -> ONE merged system (the Chat rule)
+        ResponsesRequest r = pres("{\"model\":\"" + m + "\",\"input\":["
+                                 "{\"role\":\"developer\",\"content\":\"base instructions\"},"
+                                 "{\"role\":\"developer\",\"content\":\"<skills/> guidance\"},"
+                                 "{\"role\":\"user\",\"content\":\"go\"}]}");
+        const auto &ms = r.chat.messages.as_array("messages");
+        ok(ms.size() == 2, "two leading developer messages merge into system + user");
+        ok(!ms.empty() && ms[0].find("role")->as_string("r") == "system" &&
+                   !ms.empty() && ms[0].find("content")->as_string("c") == "base instructions\n\n<skills/> guidance",
+           "merged in order with the Chat delimiter (blank line)");
+    }
+    {  // instructions joins the leading system group too
+        ResponsesRequest r = pres("{\"model\":\"" + m + "\",\"instructions\":\"instr\",\"input\":["
+                                 "{\"role\":\"system\",\"content\":\"s1\"},{\"role\":\"user\",\"content\":\"go\"}]}");
+        const auto &ms = r.chat.messages.as_array("messages");
+        ok(ms.size() == 2 && ms[0].find("content")->as_string("c") == "instr\n\ns1",
+           "instructions + a leading system merge in order");
+    }
+    {  // mid-conversation system/developer: a typed 400 naming the field, not a render-time failure
+        int st = 0;
+        std::string msg;
+        std::string p1 = err_param_of("{\"model\":\"" + m + "\",\"input\":["
+                                      "{\"role\":\"user\",\"content\":\"go\"},{\"role\":\"developer\",\"content\":\"mid\"}]}",
+                                      &st, &msg);
+        ok(p1 == "input" && st == 400 && msg.find("leading") != std::string::npos,
+           "a system/developer item after the conversation started is a named 400, got: ", msg);
+        std::string p2 = err_param_of("{\"model\":\"" + m + "\",\"input\":["
+                                      "{\"role\":\"user\",\"content\":\"go\"},"
+                                      "{\"type\":\"function_call\",\"call_id\":\"c1\",\"name\":\"f\",\"arguments\":\"{}\"},"
+                                      "{\"type\":\"function_call_output\",\"call_id\":\"c1\",\"output\":\"ok\"},"
+                                      "{\"role\":\"system\",\"content\":\"mid\"}]}",
+                                      &st, &msg);
+        ok(p2 == "input" && st == 400, "a system item after a tool round is the same refusal, got ", st);
+    }
+    {  // leading run then the conversation: the merged system is index 0 and the order of texts is exact
+        ResponsesRequest r = pres("{\"model\":\"" + m + "\",\"input\":["
+                                 "{\"role\":\"system\",\"content\":\"a\"},{\"role\":\"developer\",\"content\":\"b\"},"
+                                 "{\"role\":\"system\",\"content\":\"c\"},{\"role\":\"user\",\"content\":\"go\"}]}");
+        const auto &ms = r.chat.messages.as_array("messages");
+        ok(ms.size() == 2 && ms[0].find("content")->as_string("c") == "a\n\nb\n\nc",
+           "the whole leading run (any system/developer mix) merges, in order");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -359,6 +413,7 @@ int main(int argc, char **argv) {
         check_real_codex_request(fixture);
         check_negatives(fixture);
         check_structured_and_images();
+        check_leading_system();
     } catch (const std::exception &e) {
         std::printf("FAIL (unhandled): %s\n", e.what());
         return 2;

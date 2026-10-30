@@ -70,6 +70,9 @@ void check_tools(const json::Value &tools) {
 
 // Several leading system messages (opencode sends two) become one, their texts joined by a blank line - the
 // template accepts a single system message, first. Content may be a string or text parts.
+}  // namespace (anon) — merge_leading_system is exported (declared in openai.hpp, shared with the Responses
+   // normalizer), so it sits at strix scope: the anon-namespace copy would shadow it and the Chat call site
+   // (below) is then ambiguous.
 json::Value merge_leading_system(const json::Value &messages) {
     const auto &ms = messages.as_array("messages");
     size_t n = 0;
@@ -101,6 +104,8 @@ json::Value merge_leading_system(const json::Value &messages) {
     for (size_t k = n; k < ms.size(); ++k) out.push(ms[k]);
     return out;
 }
+
+namespace {
 
 // The fields /v1/chat/completions and /v1/completions share: stream, return_progress, max_tokens, sampling, stop, and
 // the known fields that are refused rather than ignored. R has stream, return_progress, max_tokens, sampling, seeded,

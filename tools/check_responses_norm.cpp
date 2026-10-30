@@ -88,15 +88,15 @@ std::vector<PosCase> positive_cases() {
          }},
         {"system item stays system", body("\"input\":[{\"type\":\"message\",\"role\":\"system\",\"content\":\"s\"},{\"type\":\"message\",\"role\":\"user\",\"content\":\"q\"}]"),
          [&](const ResponsesRequest &r) { STRIX_CHECK(roles(r) == "system,user", "roles: ", roles(r)); }},
-        {"interleaved system/developer/user/assistant keep their order", body("\"input\":["
+        {"leading system/developer run merges, conversation order kept (review B1)", body("\"input\":["
+             "{\"type\":\"message\",\"role\":\"system\",\"content\":\"s0\"},"
+             "{\"type\":\"message\",\"role\":\"developer\",\"content\":\"d0\"},"
              "{\"type\":\"message\",\"role\":\"user\",\"content\":\"q1\"},"
              "{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"a1\"},"
-             "{\"type\":\"message\",\"role\":\"developer\",\"content\":\"d2\"},"
-             "{\"type\":\"message\",\"role\":\"system\",\"content\":\"s2\"},"
              "{\"type\":\"message\",\"role\":\"user\",\"content\":\"q2\"}]"),
          [&](const ResponsesRequest &r) {
-             STRIX_CHECK(roles(r) == "user,assistant,system,system,user", "roles: ", roles(r));
-             STRIX_CHECK(content(r, 4) == "q2" && content(r, 2) == "d2", "order lost");
+             STRIX_CHECK(roles(r) == "system,user,assistant,user", "roles: ", roles(r));
+             STRIX_CHECK(content(r, 0) == "s0\n\nd0" && content(r, 3) == "q2", "merge lost text/order");
          }},
         {"content parts concatenate in order", body("\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"a\"},{\"type\":\"input_text\",\"text\":\"b\"}]}]"),
          [&](const ResponsesRequest &r) { STRIX_CHECK(content(r, 0) == "ab", "parts: ", content(r, 0)); }},
@@ -178,6 +178,7 @@ struct NegCase {
 std::vector<NegCase> negative_cases() {
     return {
         {"input with role tool is refused (outputs are *_output items)", body("\"input\":[{\"type\":\"message\",\"role\":\"tool\",\"content\":\"x\"}]"), "input"},
+        {"system/developer after the conversation started: input 400 (leading run only, B1)", body(R"("input":[{"type":"message","role":"user","content":"q"},{"type":"message","role":"developer","content":"mid"}])"), "input"},
         {"lone call item without a user message: input 400 (pairing now replayed, the query is required)", body("\"input\":[{\"type\":\"function_call\",\"name\":\"f\",\"arguments\":\"{}\",\"call_id\":\"c\"}]"), "input"},
         {"tool output with no matching call: refused (unpaired)", body("\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"c\",\"output\":\"x\"}]"), "input"},
         {"reasoning alone: metadata skipped, the user query is required", body("\"input\":[{\"type\":\"reasoning\",\"id\":\"r\"}]"), "input"},

@@ -126,7 +126,7 @@ public:
         seqs_.resize((size_t)(n_seqs > 0 ? n_seqs : 1));
     }
 
-    int64_t capacity() const override { return 8192; }
+    int64_t capacity() const override { return 32768; }  // room for the full captured Codex fixture (~18k tokens)
     int64_t max_chunk() const override { return max_chunk_.load(); }
     int64_t logits_row() const override { return vocab_; }
     int n_seqs() const override { return n_seqs_; }
@@ -767,6 +767,31 @@ void check_routes(httplib::Client &cli, const std::string &model_id, const Token
         ok(res && res->status == 400, "a newline model name -> typed 400, got ",
            res ? std::to_string(res->status) : "none");
         ok(res && res->body.find("FORGED-MARKER-7z") != std::string::npos, "the API echo is JSON-escaped (one line)");
+    }
+    {  // External review B1: the REAL captured Codex request (two leading developer messages) must render
+       // and complete on the live route - the class of bug parse-only proof cannot see.
+        std::ifstream in("tools/testdata/codex-request-sample.json");
+        ok(in.is_open(), "the captured Codex fixture is readable (run from the repo root)");
+        if (in.is_open()) {
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            json::Value raw = json::Value::parse(ss.str());
+            json::Value clean = json::Value::object();  // strip the fixture-only provenance keys
+            for (const auto &kv : raw.as_object("fixture"))
+                if (!(kv.first.empty() || kv.first[0] == '_' || kv.first == "codex_version"))
+                    clean.set(kv.first, kv.second);
+            clean.set("model", json::Value::string(model_id));
+            clean.set("stream", json::Value::boolean(false));  // the render proof is stream-agnostic; the typed
+                                                                // body is what asserts here (streams: probe cases)
+            be.set_script(text_script);
+            auto res = cli.Post("/v1/responses", clean.dump(), "application/json");
+            ok(res && res->status == 200, "the real captured Codex request completes on the route, got ",
+               res ? std::to_string(res->status) + " " + res->body.substr(0, 160) : "none");
+            if (res && res->status == 200)
+                ok(json::Value::parse(res->body).find("status")->as_string("st") == "completed",
+                   "the fixture turn completes typed");
+            be.set_script(text_script);
+        }
     }
     {  // Chat untouched: any model name is served (the model refusal above is Responses-only), the scripted
        // answer comes back as Chat content with real usage.

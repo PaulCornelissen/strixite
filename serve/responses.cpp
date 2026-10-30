@@ -697,7 +697,25 @@ ResponsesRequest parse_responses_request(const json::Value &body, const Sampling
     if (!has_user) bad("input", "the input has no user message (the template requires a query to answer)");
     json::Value messages = json::Value::array();
     for (auto &m : msgs) messages.push(std::move(m));
-    r.chat.messages = std::move(messages);
+    // External review B1 (2026-10-27): the template accepts ONE leading system message, so the leading
+    // system/developer run (instructions first, then items in order) merges by the Chat route's own rule -
+    // merge_leading_system is shared, not duplicated. A system/developer AFTER the conversation started is
+    // a named 400 at the parser (explicit, documented semantics), never a late render-time template error.
+    {
+        const json::Value &ml = messages;
+        const auto &ms = ml.as_array("messages");
+        size_t first_turn = 0;
+        while (first_turn < ms.size() && ms[first_turn].is_object() && ms[first_turn].find("role") &&
+               ms[first_turn].find("role")->is_string() &&
+               ms[first_turn].find("role")->as_string("role") == "system")
+            ++first_turn;
+        for (size_t k = first_turn; k < ms.size(); ++k)
+            if (ms[k].is_object() && ms[k].find("role") && ms[k].find("role")->is_string() &&
+                ms[k].find("role")->as_string("role") == "system")
+                bad("input", "a system/developer item after the conversation started is not served (only "
+                             "leading system/developer messages, merged into one - the template's rule)");
+        r.chat.messages = merge_leading_system(ml);
+    }
     return r;
 }
 

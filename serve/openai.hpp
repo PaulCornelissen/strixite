@@ -85,6 +85,11 @@ constexpr int64_t kExplicitAnswerRoom = 64;
 ChatRequest parse_chat_request(const json::Value &body, const SamplingParams &defaults,
                                bool vision_enabled = false);
 
+// Several leading system messages become one, their texts joined by a blank line in order (the template
+// accepts a single leading system, first): the Chat parser's rule, shared verbatim with the Responses
+// normalizer (external review B1 - Codex sends two leading developer messages).
+json::Value merge_leading_system(const json::Value &messages);
+
 // max_tokens against the room the prompt leaves: returns the tokens to allow and sets clamped when the request
 // asked for more (or for nothing, meaning "all the room"). Throws ApiError 400 when the prompt alone fills the
 // context.
