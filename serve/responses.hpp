@@ -32,6 +32,7 @@ struct ResponsesRequest {
     json::Value tool_registry = json::Value::array();
     std::string tool_choice = "auto";
     std::string reasoning_effort;
+    bool parallel_tool_calls = true;
 };
 
 // Validates a Responses request body (parsed JSON) and normalizes it. served_model_id: the model this server
@@ -40,7 +41,7 @@ struct ResponsesRequest {
 // goes unused; unsupported semantics, unrecognized input item kinds and unknown fields are explicit 400s naming
 // the field - never silently dropped, never silently served. Throws ApiError (400, the path in `param`).
 // vision_enabled (the server's vision tower, as in the Chat parser): data-URL input_image parts in user
-// messages reach the Chat image pipeline in document order; without a tower an image part is a named refusal.
+// messages and function tool outputs reach the Chat image pipeline in document order; without a tower an image part is a named refusal.
 ResponsesRequest parse_responses_request(const json::Value &body, const SamplingParams &defaults,
                                           const std::string &served_model_id, bool vision_enabled = false);
 

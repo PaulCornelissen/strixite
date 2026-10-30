@@ -163,7 +163,7 @@ ServedVision load_vision_config(const std::string &preprocessor_config_path, con
     return out;
 }
 
-ParsedImage parse_data_url(const std::string &url, const std::string &where) {
+ParsedImage parse_data_url(const std::string &url, const std::string &where, bool allow_octet_stream) {
     ParsedImage out;
     if (url.rfind("http://", 0) == 0 || url.rfind("https://", 0) == 0)
         STRIX_FAIL(where, ": a remote image URL '", url.substr(0, 48),
@@ -185,13 +185,17 @@ ParsedImage parse_data_url(const std::string &url, const std::string &where) {
     if (out.mime == "image/x-ms-bmp" || out.mime == "image/x-bmp") out.mime = "image/bmp";
     if (out.mime == "image/tga" || out.mime == "image/x-targa" || out.mime == "image/targa") out.mime = "image/x-tga";
     STRIX_CHECK(out.mime == "image/png" || out.mime == "image/jpeg" || out.mime == "image/gif" ||
-                    out.mime == "image/bmp" || out.mime == "image/x-tga" || out.mime == "image/webp",
+                    out.mime == "image/bmp" || out.mime == "image/x-tga" || out.mime == "image/webp" ||
+                    (allow_octet_stream && out.mime == "application/octet-stream"),
                 where, ": media type '", out.mime,
                 "' is not served (image/png, image/jpeg, image/gif, image/bmp, image/x-tga or image/webp)");
     const std::string payload = url.substr(comma + 1);
     STRIX_CHECK(!payload.empty(), where, ": data URL with an empty base64 payload");
     out.bytes = base64_decode(payload, where);
     STRIX_CHECK(!out.bytes.empty(), where, ": data URL decoded to 0 bytes");
+    if (out.mime == "application/octet-stream")
+        STRIX_CHECK(is_supported_image_format(out.bytes.data(), out.bytes.size()), where,
+                    ": application/octet-stream payload has no supported image signature");
     return out;
 }
 

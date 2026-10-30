@@ -52,8 +52,7 @@ void check_tool_name(const std::string &name, const std::string &param) {
                         "or a tag-significant character ('<', '>', '=')");
 }
 
-// One text content part's text; parts the build can't serve yet are explicit 400s (never dropped).
-// One content part. Text and refusal parts yield text; an image part (user messages, and only when the server
+// One content part. Text and refusal parts yield text; an image part (user messages or function outputs; the server
 // runs a vision tower) yields the Chat part shape and appends its parsed bytes to `images` - document order
 // everywhere (parts, then items), which is exactly the Chat pipeline's stream order. Remote URLs and file ids
 // are named refusals: this server fetches nothing and stores nothing, and says so.
@@ -90,7 +89,7 @@ void normalize_part(const json::Value &part, const std::string &param, const std
     }
     if (t == "input_image") {
         if (!allow_images)
-            bad(param, "'" + path + "' is an image part: images are served in user message content only");
+            bad(param, "'" + path + "' is an image part: images are served in user messages and function tool outputs only");
         if (!vision_enabled)
             bad(param, "'" + path + "' is an image part: this server runs without a vision tower (config vision)"
                               " - images are not served");
@@ -111,7 +110,7 @@ void normalize_part(const json::Value &part, const std::string &param, const std
                 bad(param, "'" + path + ".detail' must be \"auto\", \"low\" or \"high\", got '" + ds + "'");
         }
         try {
-            images.push_back(vision::parse_data_url(url, path));  // the Chat pipeline's one data-URL rule
+            images.push_back(vision::parse_data_url(url, path, /*allow_octet_stream=*/true));  // the Chat pipeline's one data-URL rule
         } catch (const Error &e) {
             bad(param, e.what());
         }
@@ -129,15 +128,6 @@ void normalize_part(const json::Value &part, const std::string &param, const std
     if (t == "input_file" || t == "input_audio" || t == "audio" || t == "video")
         bad(param, "'" + path + "' is a '" + t + "' part: only text and (user, vision) image parts are served");
     bad(param, "'" + path + ".type' is unrecognized: '" + t + "'");
-}
-
-// Text-only view of a part (tool-output content: an image there is a named refusal, never a drop).
-std::string part_text(const json::Value &part, const std::string &param, const std::string &path) {
-    std::vector<vision::ParsedImage> none;
-    std::string text;
-    bool ignored = false;
-    normalize_part(part, param, path, /*vision_enabled=*/true, /*allow_images=*/false, none, text, nullptr, ignored);
-    return text;
 }
 
 json::Value normalize_item(const json::Value &item, size_t k, bool vision_enabled,
@@ -301,7 +291,7 @@ void append_call_item(const json::Value &item, size_t k, const char *kind, std::
 
 // One tool result (*_output) closed against its call: a `role: tool` message, the template's tool turn.
 void append_output_item(const json::Value &item, size_t k, const char *kind, std::vector<json::Value> &msgs,
-                        HistoryState &st) {
+                        HistoryState &st, bool vision_enabled, std::vector<vision::ParsedImage> &images) {
     const std::string path = "input[" + std::to_string(k) + "]";
     const json::Value *cid = item.find("call_id");
     if (!is_string(cid) || cid->as_string("call_id").empty())
@@ -315,18 +305,27 @@ void append_output_item(const json::Value &item, size_t k, const char *kind, std
         bad("input", "'" + path + "' is a " + kind + "_call_output for a " + it->second + " call");
     st.pending.erase(it);
     std::string text;
+    std::vector<json::Value> parts;
+    bool has_image = false;
     const json::Value *content = item.find("output");
     if (!content || content->is_null()) text = "";  // an empty tool result is legal (a command with no output)
     else if (content->is_string()) text = content->as_string("output");
     else if (content->is_array())
         for (size_t p = 0; p < content->as_array("output").size(); ++p)
-            text += part_text(content->as_array("output")[p], "input", path + ".output[" + std::to_string(p) + "]");
+            normalize_part(content->as_array("output")[p], "input", path + ".output[" + std::to_string(p) + "]",
+                           vision_enabled, std::string(kind) == "function", images, text, &parts, has_image);
     else
         bad("input", "'" + path + ".output' must be a string, an array of content parts, or null");
     json::Value m = json::Value::object();
     m.set("role", json::Value::string("tool"));
     m.set("tool_call_id", json::Value::string(call_id));
-    m.set("content", json::Value::string(std::move(text)));
+    if (has_image) {
+        json::Value arr = json::Value::array();
+        for (auto &part : parts) arr.push(std::move(part));
+        m.set("content", std::move(arr));
+    } else {
+        m.set("content", json::Value::string(std::move(text)));
+    }
     msgs.push_back(std::move(m));
     st.asst = -1;  // the assistant turn is answered; the next call opens a new one
     st.calls_open = false;
@@ -425,13 +424,21 @@ void parse_tools(const json::Value *tools, ResponsesRequest &r, const std::strin
                     const json::Value *ftype = f->find("type");
                     if (!(is_string(ftype) && ftype->as_string("type") == "grammar"))
                         bad("tools", "'" + path + ".format.type': only \"grammar\" is served, got '" +
-                                (is_string(ftype) ? ftype->as_string("type") : std::string(json::type_name(ftype->type()))) + "'");
+                                (is_string(ftype) ? ftype->as_string("type") : std::string(ftype ? json::type_name(ftype->type()) : "missing")) + "'");
+                    // Current Codex uses {type:"grammar", syntax, definition}; older fixtures nested
+                    // those fields under grammar:{type, definition}. Both describe raw input, not a
+                    // constraint this server can enforce. Keep the grammar visible to the model.
                     const json::Value *g = f->find("grammar");
-                    if (!g || !g->is_object()) bad("tools", "'" + path + ".format' needs a grammar object");
-                    const json::Value *gtype = g->find("type"), *def = g->find("definition");
-                    if (!is_string(gtype)) bad("tools", "'" + path + ".format.grammar.type' must be a string");
+                    const bool nested = g != nullptr;
+                    if (nested && (f->find("syntax") || f->find("definition")))
+                        bad("tools", "'" + path + ".format' mixes nested and flat grammar fields");
+                    if (!g) g = f;
+                    if (!g->is_object()) bad("tools", "'" + path + ".format.grammar' must be an object");
+                    const std::string gp = path + (nested ? ".format.grammar" : ".format");
+                    const json::Value *gtype = g->find(nested ? "type" : "syntax"), *def = g->find("definition");
+                    if (!is_string(gtype)) bad("tools", "'" + gp + (nested ? ".type" : ".syntax") + "' must be a string");
                     if (!is_string(def) || def->as_string("definition").empty())
-                        bad("tools", "'" + path + ".format.grammar.definition' must be a non-empty string");
+                        bad("tools", "'" + gp + ".definition' must be a non-empty string");
                     format_text = "Raw input grammar (" + gtype->as_string("type") +
                                   ", shown to the model; the server does not enforce it):\n" +
                                   def->as_string("definition");
@@ -547,7 +554,8 @@ ResponsesRequest parse_responses_request(const json::Value &body, const Sampling
         if (r.tool_choice != "auto" && r.tool_choice != "none")
             bad("tool_choice", "'tool_choice': '" + r.tool_choice + "' is not served (only \"auto\" and \"none\")");
     }
-    if (const json::Value *v = field(body, "parallel_tool_calls"); v) get_bool(*v, "parallel_tool_calls", "parallel_tool_calls");  // accepted: the parser emits every call the model writes
+    if (const json::Value *v = field(body, "parallel_tool_calls"))
+        r.parallel_tool_calls = get_bool(*v, "parallel_tool_calls", "parallel_tool_calls");
 
     // reasoning: effort maps onto the template's thinking block (the real knobs); a summary is never invented -
     // the raw reasoning streams, encrypted_content is reported null.
@@ -685,11 +693,11 @@ ResponsesRequest parse_responses_request(const json::Value &body, const Sampling
                 continue;
             }
             if (t == "function_call_output") {
-                append_output_item(item, k, "function", msgs, st);
+                append_output_item(item, k, "function", msgs, st, vision_enabled, r.chat.images);
                 continue;
             }
             if (t == "custom_tool_call_output") {
-                append_output_item(item, k, "custom", msgs, st);
+                append_output_item(item, k, "custom", msgs, st, vision_enabled, r.chat.images);
                 continue;
             }
             // A text message item ends the transcript's open turn: a call without its output may not be crossed

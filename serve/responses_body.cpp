@@ -18,6 +18,10 @@ json::Value responses_body(const ResponsesRequest &rr, const std::string &resp_i
     if (res.finish_reason == "cancelled")
         fail500("the request was cancelled before an answer (the client went away)");
 
+    if (rr.tool_choice == "none" && !calls.empty())
+        fail500("the model emitted a tool call despite tool_choice:none");
+    if (!rr.parallel_tool_calls && calls.size() > 1)
+        fail500("the model emitted multiple calls despite parallel_tool_calls:false");
     json::Value out = json::Value::array();
     size_t idx = 0;
     const auto item_id = [&](const char *kind) {
@@ -109,7 +113,7 @@ json::Value responses_body(const ResponsesRequest &rr, const std::string &resp_i
     body.set("error", json::Value());
     body.set("output", std::move(out));
     body.set("output_text", json::Value::string(content));
-    body.set("parallel_tool_calls", json::Value::boolean(true));
+    body.set("parallel_tool_calls", json::Value::boolean(rr.parallel_tool_calls));
     body.set("store", json::Value::boolean(false));  // stateless by contract (validated at parse)
 
     json::Value usage = json::Value::object();

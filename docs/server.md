@@ -158,7 +158,7 @@ its full input (a `GET /v1/responses/{id}` gets a typed 404 that says so, `store
 | `instructions` | prepended as a `system` message |
 | `tools` | `function` (flat `name`/`description`/`parameters`), `custom` (freeform, e.g. `apply_patch`), `namespace` groups; names checked against template/tag forgery (a control byte, `<`, `>` or `=` is a named 400) |
 | `tool_choice` | `"auto"` (default) or `"none"`; a named tool choice is a 400 (the server cannot force a call the model's template does not constrain) |
-| `parallel_tool_calls` | accepted as a shape marker: every call the model writes is published, there is no cap to lift |
+| `parallel_tool_calls` | defaults to `true`; `false` permits one call, and fails the turn before publishing calls if the model writes more |
 | `stream` | typed Responses SSE (see below) |
 | `store` | `false`/absent; `true` is a 400 (stateless) |
 | `max_output_tokens` | clamped to the room the context leaves, as Chat's `max_tokens` (the answer never truncates the prompt) |
@@ -232,6 +232,10 @@ semantics the Chat route runs - the same functions):
 | `"medium"` | thinking on, template effort `medium` |
 | `"high"`, `"xhigh"` | thinking on, template effort `xhigh` (the model's default depth) |
 
+When `max_output_tokens` is omitted, generation may use all remaining context; there is no separate fixed
+Responses output cap. The server's `thinking-cap` setting can bound thinking for requests that supply no budget.
+The Codex smoke tests here exercise finite tasks; they do not establish a bound for every agent turn.
+
 An explicit effort (anything but `none`) marks thinking as requested: with `max_output_tokens` set, the budget is
 `max_output_tokens - max(64, 15%)` - the Chat rule, so the answer always keeps its room. A `reasoning.summary`
 value is accepted (it is part of what Codex sends) and changes nothing: the raw text is what streams.
@@ -261,7 +265,8 @@ output is constrained whether the client asked strictly or not. A schema the com
 keywords, schema-typed `additionalProperties`, tuple `items`) is a 400 naming the keyword - never a silent
 downgrade to unconstrained output.
 
-Images: a user message's content array may interleave `input_text` and `input_image` parts, and the images reach
+Images: user message content and `function_call_output.output` arrays may interleave `input_text` and
+`input_image` parts (including Codex `view_image` results), and the images reach
 the vision pipeline in document order - **when the server runs with a vision tower** (config `vision`). Every
 other case is a named refusal, never a silent drop:
 
@@ -269,7 +274,9 @@ other case is a named refusal, never a silent drop:
 - `image_url` must be a `data:` URL - the server fetches nothing, so `https://` URLs are refused
 - `file_id` is refused: the Responses surface here is stateless, there is no file store
 - `detail` is validated (`auto`, `low`, `high`)
-- images in assistant messages or tool outputs, and audio/video/file parts, are refused as named
+- Responses accepts `application/octet-stream` data URLs only with a supported image signature; full image
+  decoding and the existing size limits still apply
+- images in assistant messages or custom tool outputs, and audio/video/file parts, are refused as named
 
 The vision path through `/v1/responses` is the Chat route's pipeline verbatim (one shared implementation: same
 pad expansion, mRoPE walk, decode memo, preprocess gate); its behavior on a real tower is exercised on
@@ -319,23 +326,51 @@ curl -s localhost:5300/v1/responses -H 'Content-Type: application/json' \
      -d '{"model": "gpt-6", "input": "hi"}'               # 400: this runs its own model, by name
 ```
 
-### A runnable Codex profile (`~/.codex/config.toml`)
+### A runnable Codex provider and profile
+
+For codex-cli 0.166.0, add the provider to `~/.codex/config.toml`, preserving your existing defaults:
 
 ```toml
 [model_providers.strixite]
 name = "Strixite (local)"
 base_url = "http://127.0.0.1:5300/v1"
 wire_api = "responses"
-
-[profiles.strixite]
-model = "qwen3.8-flash-next"          # GET /v1/models answers the served id - name that
-model_provider = "strixite"
-show_raw_agent_reasoning = true       # the raw thinking streams; nothing is summarized here
 ```
 
-`codex --profile strixite` then drives this endpoint: tools, streamed turns, multi-round calls. (Verified
-against codex-cli 0.162.1 request shapes; the live end-to-end run of this profile against the model needs the
-Strix Halo runtime - it is documented here, not claimed as executed on a host without weights.)
+Create `~/.codex/strixite.config.toml` alongside it (current Codex uses a separate profile file):
+
+```toml
+model = "qwen3.8-flash-next"          # GET /v1/models answers the served id - name that
+model_provider = "strixite"
+show_raw_agent_reasoning = true       # top-level in the profile file, not a [profiles.strixite] key
+model_reasoning_effort = "low"
+model_context_window = 524288         # match the running server's /v1/models context_length
+model_catalog_json = "/home/YOUR_USER/.codex/strixite-models.json"
+web_search = "disabled"              # Strixite does not execute hosted web search
+```
+
+Copy `deploy/codex-models.json` to `~/.codex/strixite-models.json` and replace `YOUR_USER` in the profile
+with your actual user directory. The catalog describes this server's model and tool capabilities; it is not
+OpenAI's model catalog. Its context and image settings assume the supplied 512k, vision-enabled server config;
+adjust those fields if you change the server settings. The catalog also supplies a short local coding-assistant
+instruction instead of borrowing another model's instructions. Without it, Codex 0.166.0 tries to decode the
+Chat-compatible `/v1/models` response as a Codex catalog and falls back to missing-model metadata.
+
+Select it with `codex --profile strixite`. See the official
+[Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference) for profile files.
+For older Codex versions that use `[profiles.strixite]` in the main config, put only `model` and
+`model_provider` in that table; put `show_raw_agent_reasoning` at the top of the main config, before any table.
+
+The catalog and profile were exercised with codex-cli 0.166.0 on a two-slot Strix Halo server using
+Qwen3.8-Flash-Next: shell calls, freeform `apply_patch` edits, unittest execution, `view_image` output replay,
+and namespaced subagent spawn/wait/close with inherited Qwen settings. The asynchronous command test used
+`write_stdin` to collect a real process result. This verifies those workflows, not every Codex feature.
+The older request fixtures were captured with codex-cli 0.162.1.
+
+A repeatable coding smoke test is `codex exec --profile strixite --cd /path/to/disposable-project
+'Read calc.py, fix add so 2+3=5 using apply_patch, create a unittest, run it, and report the result.'`
+Use a disposable project containing an intentionally incorrect `add(a, b)`; verify the actual diff and test
+exit code, not just the model's final message.
 
 ### What is tested where
 

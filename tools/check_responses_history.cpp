@@ -335,11 +335,65 @@ void check_namespaced_history() {
     }
 }
 
+
+// Codex view_image returns a content array with an octet-stream data URL.
+void check_image_output() {
+    const std::string png = "data:application/octet-stream;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p1sAAAAASUVORK5CYII=";
+    const auto request = [&](const std::string &url) {
+        json::Value b = json::Value::parse(head(
+            R"({"role":"user","content":"look"},{"type":"function_call","name":"view_image","call_id":"img","arguments":"{}"},)"
+            R"({"type":"function_call_output","call_id":"img","output":[]},{"role":"user","content":"describe"})"));
+        json::Value parts = json::Value::array();
+        for (const char *text : {"before", "after"}) {
+            if (std::string(text) == "after") {
+                json::Value part = json::Value::object();
+                part.set("type", json::Value::string("input_image"));
+                part.set("image_url", json::Value::string(url));
+                part.set("detail", json::Value::string("high"));
+                parts.push(part);
+            }
+            json::Value part = json::Value::object();
+            part.set("type", json::Value::string("input_text"));
+            part.set("text", json::Value::string(text));
+            parts.push(part);
+        }
+        auto items = b.find("input")->as_array("input");
+        items[2].set("output", parts);
+        json::Value input = json::Value::array();
+        for (auto &item : items) input.push(item);
+        b.set("input", input);
+        return b;
+    };
+    const json::Value b = request(png);
+    try {
+        auto r = parse_responses_request(b, kDefaults, kModel, true);
+        const auto &parts = at(r, 2).find("content")->as_array("parts");
+        ok(parts.size() == 3 && parts[0].find("text")->as_string("text") == "before" &&
+           parts[1].find("type")->as_string("type") == "image_url" &&
+           parts[2].find("text")->as_string("text") == "after", "tool output text/image order preserved");
+        ok(r.chat.images.size() == 1, "one tool output image reaches vision pipeline");
+        const auto prompt = render_chat(r.chat.messages, nullptr, r.chat.template_options, nullptr, true);
+        ok(prompt.find("before") < prompt.find("after"), "image tool output renders in order");
+        auto images = vision::prepare_images(r.chat.images, vision::ServedVision{});
+        ok(images.size() == 1 && images[0].merged_tokens > 0, "octet-stream PNG decodes with existing limits");
+    } catch (const std::exception &e) { ok(false, "Codex image replay rejected: ", e.what()); }
+    expect_400(b.dump(), "image tool output refuses without vision");
+    for (const std::string &url : {std::string("https://example.com/image.png"),
+                                  std::string("data:application/octet-stream;base64,aGk=")}) {
+        try {
+            parse_responses_request(request(url), kDefaults, kModel, true);
+            ok(false, "unsupported tool image accepted: ", url);
+        } catch (const ApiError &e) { ok(e.status == 400 && e.param == "input", "invalid image named 400"); }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
     const std::string path = argc > 1 ? argv[1] : "tools/testdata/codex-history-2turn.json";
     try {
+        check_image_output();
         check_single_call();
         check_parallel_and_delayed();
         check_custom_round();

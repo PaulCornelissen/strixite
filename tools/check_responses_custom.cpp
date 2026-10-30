@@ -199,11 +199,26 @@ void check_rejections() {
     }
 }
 
+
+void check_current_grammar_shape() {
+    expect_tools_400(R"([{"type":"custom","name":"patch","format":{}}])", "missing format type refuses without dereferencing null");
+    expect_tools_400(R"([{"type":"custom","name":"patch","format":{"type":null}}])", "null format type refused");
+    const auto r = parse_tools(R"([{"type":"custom","name":"apply_patch","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}}])");
+    const auto &desc = r.chat.tools.as_array("tools")[0].find("function")->find("parameters")
+        ->find("properties")->find("input")->find("description")->as_string("description");
+    ok(desc.find("lark") != std::string::npos && desc.find("start: /.+/") != std::string::npos,
+       "Codex 0.166 flat grammar shape preserved in raw-input guidance");
+    expect_tools_400(R"([{"type":"custom","name":"patch","format":{"type":"grammar","syntax":1,"definition":"x"}}])", "non-string flat syntax refused");
+    expect_tools_400(R"([{"type":"custom","name":"patch","format":{"type":"grammar","syntax":"lark","definition":""}}])", "empty flat definition refused");
+    expect_tools_400(R"([{"type":"custom","name":"patch","format":{"type":"grammar","syntax":"lark","definition":"x","grammar":{"type":"lark","definition":"y"}}}])", "ambiguous grammar shapes refused");
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
     const std::string path = argc > 1 ? argv[1] : "tools/testdata/codex-custom-tools-simulated.json";
     try {
+        check_current_grammar_shape();
         const json::Value fixture = load_fixture(path);
         check_mixed_request(fixture);
         check_patch_bytes_through_the_parser(fixture);

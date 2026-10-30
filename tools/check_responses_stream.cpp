@@ -264,6 +264,25 @@ void check_unknown_tool_and_guards() {
     ok(s.ev_completed(result("stop")).empty(), "terminal is exactly once");
 }
 
+
+void check_single_call_policy_and_empty() {
+    auto rr = request_with(R"([{"type":"function","name":"f","parameters":{"type":"object"}}])");
+    ResponsesStream s("resp_single", kModel, 1, rr.tool_registry, false);
+    s.ev_created();
+    s.on_tool_call(call("c1", "f", "{}"));
+    bool refused = false;
+    try { s.on_tool_call(call("c2", "f", "{}")); }
+    catch (const ApiError &e) { refused = e.status == 500; }
+    ok(refused, "multiple calls refused when parallel calls disabled");
+    const auto frames = parse_frames(s.ev_failed("multiple calls refused"));
+    ok(frames.size() == 1 && type_of(frames.back()) == "response.failed", "one typed failure, no tool publication");
+    ok(frames.back().find("response")->find("output")->as_array("output").empty(), "no buffered call survives failure");
+    ResponsesStream empty("resp_empty", kModel, 1, rr.tool_registry);
+    empty.ev_created();
+    auto no_output = parse_frames(empty.ev_completed(result("stop")));
+    ok(type_of(no_output.back()) == "response.failed", "empty output fails consistently with non-streaming");
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -276,6 +295,7 @@ int main(int argc, char **argv) {
         check_custom_zero_arg();
         check_incomplete_and_failed();
         check_unknown_tool_and_guards();
+        check_single_call_policy_and_empty();
     } catch (const std::exception &e) {
         std::printf("FAIL (unhandled): %s\n", e.what());
         return 2;

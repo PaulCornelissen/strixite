@@ -487,6 +487,37 @@ void check_routes(httplib::Client &cli, const std::string &model_id, const Token
             ok(fc->find("arguments")->as_string("arguments") == "{\"x\":1}", "arguments typed from the schema, as JSON text");
         }
     }
+
+    {  // Generation policies are enforced before any tool item reaches the client.
+        const std::string offered = R"([{"type":"function","name":"f","parameters":{"type":"object","properties":{"x":{"type":"number"}}}}])";
+        for (bool stream : {false, true}) {
+            be.set_script(tool_script);
+            const std::string body = "{\"model\":\"" + model_id +
+                "\",\"input\":\"run f\",\"max_output_tokens\":128,\"tool_choice\":\"none\",\"tools\":" + offered +
+                ",\"stream\":" + (stream ? "true}" : "false}");
+            auto r = cli.Post("/v1/responses", body, "application/json");
+            ok(r && (stream ? r->status == 200 && r->body.find("response.failed") != std::string::npos &&
+                            r->body.find("response.output_item.done") == std::string::npos : r->status == 500),
+               "tool_choice none refuses scripted calls on both transports");
+            auto two = tool_script;
+            two.pop_back(); // remove end-of-turn; append another full call at a line boundary
+            two.push_back(tok.byte_token('\n'));
+            two.insert(two.end(), tool_script.begin(), tool_script.end());
+            be.set_script(two);
+            auto b = json::Value::parse(body);
+            b.set("tool_choice", json::Value::string("auto"));
+            b.set("parallel_tool_calls", json::Value::boolean(false));
+            r = cli.Post("/v1/responses", b.dump(), "application/json");
+            ok(r && (stream ? r->status == 200 && r->body.find("response.failed") != std::string::npos &&
+                            r->body.find("response.function_call_arguments") == std::string::npos : r->status == 500),
+               "parallel false refuses two calls before publication on both transports");
+        }
+        be.set_script({im_end});
+        auto r = cli.Post("/v1/responses", "{\"model\":\"" + model_id +
+                          "\",\"input\":\"hi\",\"reasoning\":{\"effort\":\"none\"},\"stream\":true}", "application/json");
+        ok(r && r->body.find("response.failed") != std::string::npos &&
+           r->body.find("response.completed") == std::string::npos, "empty streamed output fails explicitly");
+    }
     {  // External review B2 (2026-10-27), full wire round trip: the model calls a namespace child; the
        // response publishes it split as {namespace, name} (the wire contract), and replaying that published
        // item + its output as history completes on the route. The flat identity is restored at parse
@@ -1228,6 +1259,61 @@ void check_multislot_phase(const std::string &tok_path, const std::string &model
     thr.join();
 }
 
+
+// The backend scripts token logits only; this checks the real HTTP image preprocessing path,
+// not vision model accuracy (the latter needs the real Qwen tower).
+class ImageScriptBackend : public ScriptedLmBackend {
+public:
+    using ScriptedLmBackend::ScriptedLmBackend;
+    bool has_vision() const override { return true; }
+    LogitRows forward_image_prefill(const std::vector<int32_t> &ids, const PrefillImage &,
+                                    const std::vector<int64_t> &, int64_t n_logits, bool,
+                                    int64_t, const LogitMasks *masks) override {
+        return forward_rows(0, ids, n_logits, false, 0, masks);
+    }
+};
+void check_image_output_phase(const std::string &tok_path, const std::string &model_id) {
+    Tokenizer tok(tok_path);
+    std::vector<int32_t> script;
+    for (char c : std::string("OK")) script.push_back(tok.byte_token((uint8_t)c));
+    script.push_back(tok.id_of(sp("im_end").c_str()));
+    ImageScriptBackend be(tok.size(), script);
+    Engine::Options options;
+    options.think_nudge = false;
+    Engine engine(be, tok, options);
+    vision::ServedVision vision;
+    vision.image_token_id = tok.id_of(sp("image_pad").c_str());
+    ServerConfig cfg;
+    cfg.port = 0;
+    cfg.model_id = model_id;
+    cfg.vision = &vision;
+    HttpServer server(engine, tok, cfg);
+    const int port = server.bind();
+    std::thread thr([&] { server.serve(); });
+    try {
+        httplib::Client cli("127.0.0.1", port);
+        cli.set_read_timeout(10, 0);
+        const std::string body = R"({"model":"qwen3.8-flash-next","reasoning":{"effort":"none"},"max_output_tokens":64,"input":[
+          {"role":"user","content":"look"},
+          {"type":"function_call","name":"view_image","call_id":"image1","arguments":"{}"},
+          {"type":"function_call_output","call_id":"image1","output":[
+            {"type":"input_text","text":"before"},
+            {"type":"input_image","image_url":"data:application/octet-stream;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p1sAAAAASUVORK5CYII=","detail":"high"},
+            {"type":"input_text","text":"after"}]},
+          {"role":"user","content":"describe"}]})";
+        auto res = cli.Post("/v1/responses", body, "application/json");
+        ok(res && res->status == 200 && res->body.find("completed") != std::string::npos,
+           "Codex image tool output reaches real HTTP image path: ", res ? res->body : "no response");
+        auto invalid = json::Value::parse(body);
+        // A normal user image still uses the same downstream decoder refusal.
+        invalid.set("input", json::Value::parse(R"([{"role":"user","content":[{"type":"input_image","image_url":"data:application/octet-stream;base64,aGk="}]}])"));
+        auto bad = cli.Post("/v1/responses", invalid.dump(), "application/json");
+        ok(bad && bad->status == 400, "octet-stream non-image bytes refused on HTTP route");
+    } catch (...) { server.stop(); thr.join(); throw; }
+    server.stop();
+    thr.join();
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -1278,6 +1364,7 @@ int main(int argc, char **argv) {
         thr.join();
         check_failure_phase(tok_path, cfg.model_id);
         check_multislot_phase(tok_path, cfg.model_id);
+        check_image_output_phase(tok_path, cfg.model_id);
     } catch (const std::exception &e) {
         std::printf("FAIL (unhandled): %s\n", e.what());
         return 2;

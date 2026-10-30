@@ -187,6 +187,14 @@ void check_failures() {
     // A call for a tool the request never offered: publishing it could be acted on blindly - refuse.
     expect_500(rr, "", "", {call("call_z", "not_offered", "{}")}, result("tool_calls"),
                "unknown tool call name: refused (registry is the allowlist)");
+    auto single = request_with(R"([{"type":"function","name":"f","parameters":{"type":"object"}}])");
+    single.parallel_tool_calls = false;
+    const auto one = responses_body(single, "resp_one", 1, "", "", {call("c1", "f", "{}")}, result("tool_calls"));
+    ok(!one.find("parallel_tool_calls")->as_bool("parallel"), "single-call policy echoed");
+    expect_500(single, "", "", {call("c1", "f", "{}"), call("c2", "f", "{}")}, result("tool_calls"),
+               "parallel_tool_calls false refuses multiple calls");
+    single.tool_choice = "none";
+    expect_500(single, "", "", {call("c1", "f", "{}")}, result("tool_calls"), "tool_choice none refuses calls");
     // A custom call whose internal input argument is missing.
     ResponsesRequest rr2 = request_with("[{\"type\":\"custom\",\"name\":\"apply_patch\"}]");
     expect_500(rr2, "", "", {call("call_1", "apply_patch", "{}")}, result("tool_calls"),

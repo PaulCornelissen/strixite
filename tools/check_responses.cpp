@@ -329,9 +329,9 @@ void check_structured_and_images() {
                         "{\"type\":\"function_call_output\",\"call_id\":\"c1\",\"output\":[{\"type\":\"input_image\","
                         "\"image_url\":\"" +
                             std::string(kData) + "\"}]}]}",
-                        &st, &msg, true) == "input" &&
-                   st == 400,
-           "tool outputs are text content (an image there is refused, not dropped)");
+                        &st, &msg, false) == "input" &&
+                   st == 400 && msg.find("vision tower") != std::string::npos,
+           "tool output images refuse explicitly when vision is disabled");
         ok(err_param_of("{\"model\":\"" + m + "\",\"input\":[{\"role\":\"user\",\"content\":[{\"type\":\"input_audio\","
                         "\"input_audio\":{}}]}]}",
                         &st, &msg, true) == "input" &&

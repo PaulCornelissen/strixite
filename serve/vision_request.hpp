@@ -49,7 +49,9 @@ struct ParsedImage {
 // base64 (alphabet, padding, trailing bits), an empty payload. The payload is decoded here; the image bytes
 // themselves are validated by the preprocessor (magic, decode, channels) - decode_image refuses the rest
 // with its own messages. The bytes' own magic, not this label, decides the decoder.
-ParsedImage parse_data_url(const std::string &url, const std::string &where);
+// Responses allows Codex's octet-stream label with a supported image signature. Full decode and size
+// checks still run in prepare_images. Chat retains its existing media-type contract by default.
+ParsedImage parse_data_url(const std::string &url, const std::string &where, bool allow_octet_stream = false);
 
 // Per image, in stream order: what the walk and the engine need.
 struct ServedImage {

@@ -584,7 +584,8 @@ void HttpServer::routes() {
             // terminal (completed / incomplete / failed). No Chat chunks, no [DONE].
             res.set_header("Cache-Control", "no-cache");
             auto stream = std::make_shared<ResponsesStream>(random_id("resp_"), cfg_.model_id, unix_now(),
-                                                            rr.tool_registry);
+                                                            rr.tool_choice == "none" ? json::Value::array() : rr.tool_registry,
+                                                            rr.parallel_tool_calls);
             const std::string opening = stream->ev_created();
             const double keepalive = cfg_.keepalive_s;
             res.set_chunked_content_provider("text/event-stream",
@@ -622,6 +623,7 @@ void HttpServer::routes() {
                                     else if (e.kind == OutputEvent::Kind::ToolCall) stream->on_tool_call(e.call);
                                 }
                             } catch (const ApiError &e) {  // a call for an un-offered tool: typed terminal now
+                                sink->cancel();
                                 write(stream->ev_failed(e.what()));
                                 out.done();
                                 return true;

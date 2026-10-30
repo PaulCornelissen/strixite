@@ -1,0 +1,53 @@
+{
+  "models": [
+    {
+      "slug": "qwen3.8-flash-next",
+      "display_name": "Qwen3.8-Flash-Next (Strixite)",
+      "description": "Local Qwen3.8-Flash-Next served by Strixite on AMD Strix Halo.",
+      "default_reasoning_level": "low",
+      "supported_reasoning_levels": [
+        {
+          "effort": "none",
+          "description": "Disable thinking."
+        },
+        {
+          "effort": "low",
+          "description": "Enable thinking with template effort low."
+        },
+        {
+          "effort": "medium",
+          "description": "Enable thinking with template effort medium."
+        },
+        {
+          "effort": "high",
+          "description": "Enable thinking with template effort xhigh."
+        },
+        {
+          "effort": "xhigh",
+          "description": "Enable thinking with template effort xhigh."
+        }
+      ],
+      "shell_type": "unified_exec",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 0,
+      "base_instructions": "You are a coding assistant running Qwen3.8-Flash-Next through Strixite. Inspect the workspace, use the provided tools to make requested changes, verify results, and report actual evidence. Follow the user instructions and workspace rules.",
+      "support_verbosity": false,
+      "default_reasoning_summary": "none",
+      "apply_patch_tool_type": "freeform",
+      "context_window": 524288,
+      "max_context_window": 524288,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "supports_search_tool": false,
+      "supports_image_detail_original": false,
+      "experimental_supported_tools": [],
+      "truncation_policy": {
+        "mode": "tokens",
+        "limit": 10000
+      }
+    }
+  ]
+}

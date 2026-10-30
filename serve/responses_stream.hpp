@@ -22,7 +22,8 @@ namespace strix {
 
 class ResponsesStream {
 public:
-    ResponsesStream(std::string resp_id, std::string model, int64_t created, json::Value registry);
+    ResponsesStream(std::string resp_id, std::string model, int64_t created, json::Value registry,
+                    bool parallel_tool_calls = true);
 
     std::string ev_created();  // response.created + response.in_progress frames (starts the stream)
     void on_reasoning(const std::string &text);
@@ -61,6 +62,7 @@ private:
     std::vector<json::Value> done_items_;      // the output array (terminal body must equal it)
     std::string queue_;
     bool terminal_ = false, started_ = false;
+    bool parallel_tool_calls_ = true;
 };
 
 }  // namespace strix

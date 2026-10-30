@@ -31,8 +31,8 @@ json::Value usage_json_of(const GenerationResult &r) {
 
 }  // namespace
 
-ResponsesStream::ResponsesStream(std::string resp_id, std::string model, int64_t created, json::Value registry)
-    : id_(std::move(resp_id)), model_(std::move(model)), created_(created), registry_(std::move(registry)) {}
+ResponsesStream::ResponsesStream(std::string resp_id, std::string model, int64_t created, json::Value registry, bool parallel_tool_calls)
+    : id_(std::move(resp_id)), model_(std::move(model)), created_(created), registry_(std::move(registry)), parallel_tool_calls_(parallel_tool_calls) {}
 
 void ResponsesStream::push_event(json::Value v) {
     v.set("sequence_number", json::Value::integer(seq_++));
@@ -177,6 +177,8 @@ void ResponsesStream::on_tool_call(const ToolCallOut &call) {
                        "server_error");
     // Buffered (the request's parser is the buffered one): the call is complete and registry-valid. Its item is
     // emitted at the terminal, with the terminal's status (a capped turn's calls are incomplete like its text).
+    if (!parallel_tool_calls_ && !buffered_calls_.empty())
+        throw ApiError(500, "the model emitted multiple calls despite parallel_tool_calls:false", {}, "server_error");
     buffered_calls_.push_back(call);
 }
 
@@ -241,6 +243,7 @@ json::Value ResponsesStream::terminal_body(const char *status, const GenerationR
     body.set("created_at", json::Value::integer(created_));
     body.set("model", json::Value::string(model_));
     body.set("status", json::Value::string(status));
+    body.set("parallel_tool_calls", json::Value::boolean(parallel_tool_calls_));
     json::Value out = json::Value::array();
     for (const auto &it : done_items_) out.push(it);
     body.set("output", std::move(out));
@@ -260,8 +263,14 @@ std::string ResponsesStream::finish(const char *status, const GenerationResult *
     const char *item_status = std::string(status) == "completed" ? "completed" : "incomplete";
     close_text(reasoning_, item_status);
     close_text(message_, item_status);
-    flush_tools(item_status);
-    json::Value body = terminal_body(status, res, failure);
+    if (std::string(status) == "failed") buffered_calls_.clear();
+    else flush_tools(item_status);
+    std::string error = failure;
+    if (std::string(status) == "completed" && done_items_.empty()) {
+        status = "failed";
+        error = "the model produced no output items";
+    }
+    json::Value body = terminal_body(status, res, error);
     if (std::string(status) == "incomplete") {
         json::Value d = json::Value::object();
         d.set("reason", json::Value::string("max_output_tokens"));
